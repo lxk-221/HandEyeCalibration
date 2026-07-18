@@ -285,3 +285,26 @@ def segment_workpiece_from_base(points_base, colors_base,
     pts, cols, _, _, _, _ = ransac_remove_plane_and_greater_z(
         pts, pts, plane_thresh_m, ransac_n=3, ransac_iter=1000, min_inlier_ratio=0.05)
     return pts, cols
+
+
+# ---------------- 可视化 ----------------
+def show_match(scene_points, scene_colors, workpiece_points,
+               workpiece_color=(0.05, 0.85, 0.20)):
+    """弹窗显示: 场景点云 (原色/灰) + 工件模板点云 (绿色) 叠加, 直观核对 ICP 匹配。
+    关闭窗口后返回 (阻塞)。
+    - scene_points: (N,3) base 系米; scene_colors: (N,3) uint8 RGB 或 None
+    - workpiece_points: (M,3) base 系米 (已配准); workpiece_color: float (r,g,b) 0..1"""
+    scene = o3d.geometry.PointCloud()
+    scene.points = o3d.utility.Vector3dVector(np.asarray(scene_points, dtype=np.float64))
+    if scene_colors is not None and len(scene_colors) == len(scene_points):
+        scene.colors = o3d.utility.Vector3dVector(
+            np.clip(np.asarray(scene_colors, dtype=np.float64) / 255.0, 0.0, 1.0))
+    else:
+        scene.paint_uniform_color([0.7, 0.7, 0.7])
+
+    wp = o3d.geometry.PointCloud()
+    wp.points = o3d.utility.Vector3dVector(np.asarray(workpiece_points, dtype=np.float64))
+    wp.paint_uniform_color(workpiece_color)
+
+    o3d.visualization.draw_geometries([scene, wp],
+                                      window_name="ICP match (绿=工件模板, 灰/原色=场景; 关闭继续)")

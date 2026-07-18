@@ -132,7 +132,7 @@ def main(argv=None):
             print(f"多帧拼合 (base 系): {len(pts_base)} 点")
             pts_base, cols_base = pc.voxel_downsample(pts_base, cols_base, VOXEL_SIZE_M)
             print(f"voxel 下采样 ({VOXEL_SIZE_M*1000}mm): {len(pts_base)} 点")
-            pts_seg, _ = pc.segment_workpiece_from_base(pts_base, cols_base)
+            pts_seg, cols_seg = pc.segment_workpiece_from_base(pts_base, cols_base)
             print(f"分割后: {len(pts_seg)} 点")
             if len(pts_seg) < 50:
                 raise RuntimeError(f"分割后点太少 ({len(pts_seg)}), 无法做模板匹配")
@@ -149,7 +149,9 @@ def main(argv=None):
             arm_T[:3, :3] = Rot.from_euler("xyz", APPROACH_RPY_RAD).as_matrix()
             arm_T[:3, 3] = arm_xyz
 
-            # 5. 人工确认: 展示匹配质量 + 工件中心 + 目标位姿, 确认后再执行 (安全)。
+            # 5. 人工确认: 点云可视化 + 打印匹配结果, 确认后再执行 (安全)。
+            if not args.yes:
+                pc.show_match(pts_seg, cols_seg, match.aligned_points)
             info = match.info
             print("\n========== 模板匹配结果 ==========")
             print(f"  ICP fitness = {info.get('fitness', '?'):.4f}   "
