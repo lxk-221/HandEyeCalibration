@@ -37,12 +37,14 @@ import arm_command          # noqa: E402
 import hand_command         # noqa: E402
 import execution_feedback   # noqa: E402
 import ee_pose              # noqa: E402
+import joint_command        # noqa: E402
 import lcm                  # noqa: E402
 
 CHANNEL_ARM = "arm_command"
 CHANNEL_HAND = "hand_command"
 CHANNEL_FEEDBACK = "execution_feedback"
 CHANNEL_EE_POSE = "ee_pose"
+CHANNEL_JOINT = "joint_command"      # 关节空间运动 (WARMUP/COOLDOWN, 避奇异)
 
 
 class LcmCommander:
@@ -129,6 +131,25 @@ class LcmCommander:
         fb = self._wait_feedback(cmd_id, timeout or self._default_timeout)
         if not fb.success:
             raise RuntimeError(f"arm 指令 cmd_id={cmd_id} 执行失败: {fb.error}")
+        return True
+
+    def move_joints(self, joints, speed=0.8, accel=0.8, block=True,
+                    timeout: Optional[float] = None) -> bool:
+        """发关节空间运动指令 (WARMUP/COOLDOWN 用, 避开笛卡尔插值的奇异/碰撞)。
+        joints: 7 关节角 (弧度)。阻塞等 feedback。"""
+        cmd_id = self._alloc_cmd_id()
+        msg = joint_command.joint_command()
+        msg.cmd_id = cmd_id
+        msg.joints = [float(v) for v in joints[:7]]
+        msg.speed = float(speed)
+        msg.accel = float(accel)
+        msg.block = bool(block)
+        self._lc.publish(CHANNEL_JOINT, msg.encode())
+        if not block:
+            return True
+        fb = self._wait_feedback(cmd_id, timeout or self._default_timeout)
+        if not fb.success:
+            raise RuntimeError(f"joint 指令 cmd_id={cmd_id} 执行失败: {fb.error}")
         return True
 
     def move_hand(self, positions, timeout: Optional[float] = None) -> bool:

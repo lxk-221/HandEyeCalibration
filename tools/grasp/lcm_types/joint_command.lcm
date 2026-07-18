@@ -1,0 +1,11 @@
+// 关节空间运动指令 (主控发布, 接收端订阅后翻译成 move_joint)。
+// 用于 WARMUP/COOLDOWN: 关节空间路径可控, 避开笛卡尔插值可能触发的奇异/碰撞。
+// joints: 7 关节角 (弧度)。
+struct joint_command
+{
+    int64_t  cmd_id;          // 与 arm_command.cmd_id 同机制 (配 execution_feedback 阻塞)
+    double   joints[7];       // 7 关节角 (弧度)
+    double   speed;           // 0..1
+    double   accel;           // 0..1
+    boolean  block;           // 是否阻塞到位
+}

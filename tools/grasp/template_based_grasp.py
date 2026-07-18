@@ -45,10 +45,28 @@ def _scan_pose(xyz, rpy_deg):
     return T
 
 SCAN_POSES = [
-    _scan_pose([0.394, -0.292, -0.223], [-2.4, 2.4, 90.7]),
+    #_scan_pose([0.394, -0.292, -0.223], [-2.4, 2.4, 90.7]), # real example, dont delete
+    _scan_pose([0.394, -0.292, -0.223], [0, 0, 90]),
+    _scan_pose([0.350, -0.292, -0.223], [0, 0, 90]),
     # 可继续添加更多视角...
 ]
 VOXEL_SIZE_M = 0.002          # 多帧拼合后体素降采样粒度
+
+# ---- WARMUP/COOLDOWN 关节序列 (复用 xyz_bak client move2capture 验证过的 8 关节轨迹) ----
+# 关节空间运动, 避开笛卡尔插值可能触发的奇异/碰撞。
+# WARMUP: 零位 -> 扫描位附近 (正序); COOLDOWN: 扫描位 -> 零位 (倒序)。
+_WARMUP_JOINTS = [
+    [0,         0,        0,        0,        0, 0, 0],
+    [0,        -np.pi/2,  0,        0,        0, 0, 0],
+    [0,        -np.pi/2,  0,       -np.pi/2,  0, 0, 0],
+    [0,        -np.pi/2,  0,       -np.pi/2,  0, 0,  np.pi/2],
+    [np.pi/4,  -np.pi/4,  0,       -np.pi/2,  0, 0,  np.pi/2],
+    [np.pi/4,  -np.pi/4, -np.pi/4, -np.pi/2,  0, 0,  np.pi/2],
+    [0.740,    -0.556,   -0.774,   -1.525,   -0.880, 0.593, 1.747],
+    [0.714,    -0.678,   -0.896,   -1.439,   -0.654, 0.535, 1.509],
+]
+WARMUP_JOINTS = _WARMUP_JOINTS                    # scan 前: 零位 -> 扫描位附近
+COOLDOWN_JOINTS = list(reversed(_WARMUP_JOINTS))  # 抓取后: 扫描位 -> 零位
 
 # ---- 抓取位姿偏置 (参考 xyz_bak client 的 execute_control_pose, base 系) ----
 APPROACH_OFFSET_M = np.array([-0.07, 0.022, 0.23], dtype=np.float64)
@@ -76,6 +94,13 @@ def scan_point_clouds(cmd, cam, scan_poses):
     return frames
 
 
+def run_joint_sequence(cmd, joints_list, label):
+    """依次 move_joints 到关节序列的每个点 (阻塞)。用于 WARMUP/COOLDOWN。"""
+    for i, joints in enumerate(joints_list, 1):
+        print(f"  {label} [{i}/{len(joints_list)}] joints={np.round(joints,3).tolist()}")
+        cmd.move_joints(joints, speed=ARM_SPEED, accel=ARM_ACCEL, timeout=ARM_TIMEOUT)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="模板匹配抓取 (多视角扫描 + ICP + LCM)")
     ap.add_argument("--workpiece", required=True, help="工件模板点云 .ply 路径 (ICP source)")
@@ -91,6 +116,10 @@ def main(argv=None):
     cam = CameraCls()
     try:
         with LcmCommander(lcm_url=args.lcm_url) as cmd:
+            # 0. WARMUP: 关节空间从零位移动到扫描位附近 (避开奇异/碰撞)。
+            print("=== WARMUP (零位 -> 扫描位附近) ===")
+            run_joint_sequence(cmd, WARMUP_JOINTS, "warmup")
+
             # 1. 多视角扫描: 每个位姿取点云 + ee_pose。
             frames = scan_point_clouds(cmd, cam, SCAN_POSES)
             if not frames:
@@ -128,6 +157,10 @@ def main(argv=None):
             print("  [2/3] arm 到位 OK")
             cmd.move_hand(HAND_GRASP, timeout=HAND_TIMEOUT)
             print("  [3/3] hand 抓取 OK")
+
+            # 6. COOLDOWN: 关节空间从扫描位回到零位 (WARMUP 倒序)。
+            print("=== COOLDOWN (扫描位 -> 零位) ===")
+            run_joint_sequence(cmd, COOLDOWN_JOINTS, "cooldown")
             print("=== 抓取流程完成 ===")
     finally:
         cam.release()
