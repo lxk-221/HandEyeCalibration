@@ -233,3 +233,55 @@ def transform_pose_to_base(rotation_camera, translation_camera, T_camera2base):
     T_cam_grasp[:3, :3] = np.asarray(rotation_camera, dtype=np.float64)
     T_cam_grasp[:3, 3] = np.asarray(translation_camera, dtype=np.float64)
     return T @ T_cam_grasp
+
+
+# ---------------- 多帧拼合 (scan) ----------------
+def merge_frames_to_base(frames, T_cam2gripper):
+    """把多帧 (相机系点云 + 拍照时刻 T_gripper2base) 全部转到 base 系并拼接。
+    frames: list of (points_camera Nx3, colors_rgb Nx3 uint8, T_gripper2base 4x4)。
+    返回 (points_base Nx3 float64, colors_rgb Nx3 uint8)。"""
+    all_pts, all_cols = [], []
+    for points_cam, colors, T_g2b in frames:
+        T_c2b = camera_to_base_transform(T_g2b, T_cam2gripper)
+        pts_base = transform_points_to_base(points_cam, T_c2b)
+        all_pts.append(pts_base)
+        all_cols.append(np.asarray(colors, dtype=np.uint8))
+    if not all_pts:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.uint8)
+    return np.concatenate(all_pts, 0), np.concatenate(all_cols, 0)
+
+
+def voxel_downsample(points, colors, voxel_size):
+    """体素降采样 (open3d)。点云密度均匀化, 是多帧拼合/ICP 前的标准处理。
+    返回 (points_down Nx3 float64, colors_down Nx3 uint8)。voxel_size 单位米。"""
+    if len(points) == 0 or voxel_size <= 0:
+        return np.asarray(points), np.asarray(colors)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    if colors is not None and len(colors) == len(points):
+        pcd.colors = o3d.utility.Vector3dVector(
+            np.clip(np.asarray(colors, dtype=np.float64) / 255.0, 0.0, 1.0))
+    pcd = pcd.voxel_down_sample(voxel_size)
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    cols = np.asarray(pcd.colors, dtype=np.float64)
+    cols = np.clip(cols * 255.0, 0, 255).astype(np.uint8) if len(cols) == len(pts) else \
+        np.tile(np.array([[180, 180, 173]], dtype=np.uint8), (len(pts), 1))
+    return pts, cols
+
+
+def segment_workpiece_from_base(points_base, colors_base,
+                                distance_min_m=0.3, distance_max_m=1.2,
+                                plane_thresh_m=0.004):
+    """base 系点云的分割: 距离过滤 (到 base 原点的半径) + RANSAC 去平面。
+    把点云处理的默认参数集中在此 (避免散落到主程序的 argparse)。
+    返回 (points_seg, colors_seg)。"""
+    points_base = np.asarray(points_base, dtype=np.float64)
+    # 距离过滤: base 系下用到原点的半径 (xy 主要分布范围)
+    radius = np.linalg.norm(points_base[:, :2], axis=1)
+    keep = (radius >= distance_min_m) & (radius <= distance_max_m)
+    pts = points_base[keep]
+    cols = np.asarray(colors_base)[keep] if colors_base is not None else None
+    # RANSAC 去平面 (桌面): base 系下桌面近似 z=const, segment_plane 仍适用
+    pts, cols, _, _, _, _ = ransac_remove_plane_and_greater_z(
+        pts, pts, plane_thresh_m, ransac_n=3, ransac_iter=1000, min_inlier_ratio=0.05)
+    return pts, cols
