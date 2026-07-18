@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """LCM 指令收发封装 (主控侧)。
 
-三个独立 channel (无嵌套 struct):
+四个独立 channel (无嵌套 struct):
   arm_command          主控 -> 接收端 (机械臂运动)
   hand_command         主控 -> 接收端 (灵巧手运动)
   execution_feedback   接收端 -> 主控 (执行反馈)
+  ee_pose              接收端 -> 主控 (末端位姿实时转发, 替代主控直连 ROS 读 T_gripper2base)
 
 阻塞协议: 每条指令带自增 cmd_id; 接收端执行完后用相同 cmd_id 回 execution_feedback。
-LcmCommander.move_arm()/move_hand() 发完指令后阻塞等待对应 cmd_id 的 feedback,
-超时则报错。这样主控可以写顺序的阻塞式流程代码。
+move_arm()/move_hand() 发完指令后阻塞等待对应 cmd_id 的 feedback。
+
+末端位姿: 后台 pump 线程持续处理 LCM 消息, 把最新 ee_pose 缓存到成员变量;
+get_ee_pose() 取最新值即实时位姿 (拍照时刻直接取用, 无需依赖 ROS)。
 
 用法:
     with LcmCommander() as cmd:
         cmd.move_hand([255,10,255,255,255,255])   # 张开手, 阻塞到接收端反馈完成
+        T = cmd.get_ee_pose()                       # 取当前末端位姿 (实时)
         cmd.move_arm(T_ee2base, speed=0.8)          # 移动臂, 阻塞到位
         cmd.move_hand([0,5,70,80,80,70])            # 抓取
 """
@@ -32,15 +36,19 @@ if _LCM_TYPES_DIR not in sys.path:
 import arm_command          # noqa: E402
 import hand_command         # noqa: E402
 import execution_feedback   # noqa: E402
+import ee_pose              # noqa: E402
 import lcm                  # noqa: E402
 
 CHANNEL_ARM = "arm_command"
 CHANNEL_HAND = "hand_command"
 CHANNEL_FEEDBACK = "execution_feedback"
+CHANNEL_EE_POSE = "ee_pose"
 
 
 class LcmCommander:
-    """主控侧的 LCM 指令收发器。发 arm/hand 指令并阻塞等 execution_feedback。"""
+    """主控侧的 LCM 指令收发器。
+    后台线程持续 pump LCM (更新 ee_pose 缓存 + 收 feedback);
+    move_arm/move_hand 发指令后阻塞等对应 cmd_id 的 feedback。"""
 
     def __init__(self, lcm_url: str = "udpm://224.0.0.1?ttl=0",
                  default_timeout: float = 30.0):
@@ -48,10 +56,20 @@ class LcmCommander:
         self._default_timeout = default_timeout
         self._next_cmd_id = 1
         self._lock = threading.Lock()
-        # cmd_id -> execution_feedback 对象; 收到反馈时填入。
-        self._feedbacks = {}
+        self._feedbacks = {}              # cmd_id -> execution_feedback
         self._feedback_event = threading.Event()
-        self._sub = self._lc.subscribe(CHANNEL_FEEDBACK, self._on_feedback)
+        self._latest_ee_pose = None       # 最近一帧 ee_pose 的 4x4 (np.float64)
+        self._stop_event = threading.Event()
+        self._lc.subscribe(CHANNEL_FEEDBACK, self._on_feedback)
+        self._lc.subscribe(CHANNEL_EE_POSE, self._on_ee_pose)
+        # 后台 pump 线程: 持续处理 LCM 消息 (更新 ee_pose + 收 feedback)
+        self._pump_thread = threading.Thread(target=self._pump_loop, daemon=True)
+        self._pump_thread.start()
+
+    # ---- 后台 pump ----
+    def _pump_loop(self):
+        while not self._stop_event.is_set():
+            self._lc.handle_timeout(50)   # 50ms 非阻塞, 让 stop_event 能及时退出
 
     def _on_feedback(self, _channel, data):
         fb = execution_feedback.execution_feedback.decode(data)
@@ -59,6 +77,13 @@ class LcmCommander:
             self._feedbacks[fb.cmd_id] = fb
         self._feedback_event.set()
 
+    def _on_ee_pose(self, _channel, data):
+        msg = ee_pose.ee_pose.decode(data)
+        T = np.asarray(msg.t_ee2base, dtype=np.float64).reshape(4, 4)
+        with self._lock:
+            self._latest_ee_pose = T
+
+    # ---- 内部 ----
     def _alloc_cmd_id(self) -> int:
         with self._lock:
             cid = self._next_cmd_id
@@ -66,17 +91,28 @@ class LcmCommander:
             return cid
 
     def _wait_feedback(self, cmd_id: int, timeout: float) -> execution_feedback:
-        """阻塞等指定 cmd_id 的 feedback。"""
+        """阻塞等指定 cmd_id 的 feedback (pump 线程在后台收)。"""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            # pump 收消息 (主控侧没有独立 spin 线程, 在等待循环里 handle)
-            self._lc.handle_timeout(max(1, int((deadline - time.monotonic()) * 1000)))
+            if not self._feedback_event.wait(timeout=min(0.1, max(0, deadline - time.monotonic()))):
+                continue
+            self._feedback_event.clear()
             with self._lock:
                 if cmd_id in self._feedbacks:
                     return self._feedbacks.pop(cmd_id)
         raise TimeoutError(f"cmd_id={cmd_id} 等待 feedback 超时 ({timeout}s)")
 
-    # ---- 公开接口: 阻塞式指令 ----
+    # ---- 公开接口 ----
+    def get_ee_pose(self, timeout: float = 3.0) -> np.ndarray:
+        """取最新末端位姿 T_gripper2base (4x4, 平移米)。未收到过则阻塞等首帧。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._latest_ee_pose is not None:
+                    return self._latest_ee_pose.copy()
+            time.sleep(0.02)
+        raise TimeoutError(f"未在 {timeout}s 内收到 ee_pose (桥是否在运行?)")
+
     def move_arm(self, T_ee2base, speed=0.8, accel=0.8, block=True,
                  timeout: Optional[float] = None) -> bool:
         """发 arm 运动指令并阻塞等完成 (block=True 时)。返回是否成功。"""
@@ -109,7 +145,8 @@ class LcmCommander:
         return True
 
     def close(self):
-        self._lc.unsubscribe(self._sub)
+        self._stop_event.set()
+        self._pump_thread.join(timeout=1.0)
 
     def __enter__(self):
         return self

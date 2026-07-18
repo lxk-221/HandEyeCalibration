@@ -1,0 +1,9 @@
+// 末端位姿 (桥发布, 主控订阅)。
+// 桥把 lbot 的 /pose_states (ROS) 实时转发成此 LCM 消息, 主控订阅缓存,
+// 拍照时取最新值即 T_gripper2base, 无需依赖 ROS。
+// t_ee2base 行优先 4x4, 平移米。
+struct ee_pose
+{
+    double timestamp;        // 发布时刻 (epoch 秒)
+    double t_ee2base[16];    // T_gripper2base 4x4 (行优先)
+}
