@@ -18,6 +18,24 @@ HandEyeCalibration/
 └── poses_example.json
 ```
 
+## Installation
+
+核心数学依赖 (必装):
+
+```bash
+pip install opencv-python numpy scipy
+```
+
+按实际使用的子类安装对应硬件 SDK (解耦设计: 各子类依赖相互独立, 换硬件只改 import + 装对应库)。
+
+### Arm
+- **Franka** (`arm/franka.py`): `pip install franky`  (TCP 直连, 无 ROS)
+- **LBot** (`arm/lbot.py`): *实现暂缓* — 依赖 `rclpy` + `lbot_arm_interfaces` (ROS2 自定义 msg), 对纯 toolbox conda 环境较重。
+
+### Camera
+- **RealSense** (`camera/realsense.py`): `pip install pyrealsense2`
+- **Orbbec** (`camera/orbbec.py`): `pip install pyorbbecsdk`
+
 ## 抽象约定
 
 **Arm** (`arm/arm.py`):
