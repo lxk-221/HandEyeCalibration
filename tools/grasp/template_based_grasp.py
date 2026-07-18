@@ -104,7 +104,7 @@ def run_joint_sequence(cmd, joints_list, label):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="模板匹配抓取 (多视角扫描 + ICP + LCM)")
     ap.add_argument("--workpiece", required=True, help="工件模板点云 .ply 路径 (ICP source)")
-    ap.add_argument("--lcm-url", default="udpm://224.0.0.1?ttl=0",
+    ap.add_argument("--lcm-url", default="udpm://239.255.76.67:7667?ttl=0",
                     help="LCM 地址 (ttl=0 本机; 跨机用 ttl=1+)")
     args = ap.parse_args(argv)
 

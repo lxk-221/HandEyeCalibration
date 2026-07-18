@@ -47,24 +47,9 @@ CHANNEL_EE_POSE = "ee_pose"
 CHANNEL_JOINT = "joint_command"      # 关节空间运动 (WARMUP/COOLDOWN, 避奇异)
 
 
-def _create_lcm(lcm_url, retries=5):
-    """创建 LCM, self test 偶发失败时重试。彻底失败给出诊断+修复指引。"""
-    import time
-    last_err = None
-    for i in range(retries):
-        try:
-            return lcm.LCM(lcm_url)
-        except Exception as e:
-            last_err = e
-            print(f"[commander] LCM 创建失败 ({i+1}/{retries}): {e}，重试...")
-            time.sleep(0.5)
-    raise RuntimeError(
-        f"LCM 创建失败 ({last_err})。LCM self test 依赖多播 loopback。\n"
-        "通常原因: 系统多播路由走了无线网卡导致回环不可靠。修复:\n"
-        "  sudo ip link set lo multicast\n"
-        "  sudo ip route add 224.0.0.0/4 dev lo\n"
-        f"URL={lcm_url}"
-    )
+def _create_lcm(lcm_url):
+    """创建 LCM。self test 失败说明多播 loopback 不通, 见 NEWREADME 故障排查段。"""
+    return lcm.LCM(lcm_url)
 
 
 class LcmCommander:
@@ -72,7 +57,7 @@ class LcmCommander:
     后台线程持续 pump LCM (更新 ee_pose 缓存 + 收 feedback);
     move_arm/move_hand 发指令后阻塞等对应 cmd_id 的 feedback。"""
 
-    def __init__(self, lcm_url: str = "udpm://224.0.0.1?ttl=0",
+    def __init__(self, lcm_url: str = "udpm://239.255.76.67:7667?ttl=0",
                  default_timeout: float = 30.0):
         self._lc = _create_lcm(lcm_url)
         self._default_timeout = default_timeout
