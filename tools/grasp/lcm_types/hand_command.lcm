@@ -1,0 +1,8 @@
+// 灵巧手运动指令 (主控发布, 接收端订阅后翻译成 set_l6_joint 等)。
+// positions: 各指位置 0..255。
+struct hand_command
+{
+    int64_t  cmd_id;          // 与 arm_command.cmd_id 同机制
+    int16_t  n_dof;           // 手指数 (如 6 / 10)
+    int16_t  positions[n_dof];// 0..255
+}

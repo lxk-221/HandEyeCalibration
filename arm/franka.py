@@ -15,7 +15,7 @@ franky 是 libfranka/FCI 的 pybind11 封装, 通过 TCP 直连机器人, 不依
 import numpy as np
 import franky
 
-from arm.arm import Arm
+from .arm import Arm
 
 
 class Franka(Arm):

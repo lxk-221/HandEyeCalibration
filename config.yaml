@@ -1,0 +1,8 @@
+# BasicToolBox 当前硬件组合。
+# 换硬件只改这里的 class 名, 无需改任何代码 (由 tools/_hardware.py 按名懒加载)。
+# 留 null 表示该类硬件不使用 —— 对应模块不会被加载, 因此也不需要装其 SDK。
+# 可选值 = 各 arm/*.py / camera/*.py 里的类名:
+#   arm:    Franka / LBot
+#   camera: OrbbecCamera / RealSenseCamera
+arm: Franka
+camera: OrbbecCamera

@@ -24,7 +24,7 @@ from pyorbbecsdk import (  # type: ignore
     Pipeline,
 )
 
-from camera.camera import Camera
+from .camera import Camera
 
 
 class OrbbecCamera(Camera):
@@ -52,12 +52,20 @@ class OrbbecCamera(Camera):
         for _ in range(max(1, warmup_frames + 1)):
             fs = self._pipe.wait_for_frames(1000)
             if fs:
-                intr = self._pipe.get_camera_param().rgb_intrinsic
-                d = self._pipe.get_camera_param().rgb_distortion
-                factory_K = np.array([[intr.fx, 0.0,       intr.cx],
-                                      [0.0,       intr.fy, intr.cy],
-                                      [0.0,       0.0,     1.0    ]], dtype=np.float64)
-                factory_dist = np.array([d.k1, d.k2, d.p1, d.p2, d.k3], dtype=np.float64)
+                cp = self._pipe.get_camera_param()
+                # color 内参 -> K (手眼标定用 get_frame 的 color 图)
+                ri = cp.rgb_intrinsic
+                factory_K = np.array([[ri.fx, 0.0,    ri.cx],
+                                      [0.0,    ri.fy, ri.cy],
+                                      [0.0,    0.0,   1.0   ]], dtype=np.float64)
+                factory_dist = np.array([cp.rgb_distortion.k1, cp.rgb_distortion.k2,
+                                         cp.rgb_distortion.p1, cp.rgb_distortion.p2,
+                                         cp.rgb_distortion.k3], dtype=np.float64)
+                # depth 内参 -> depth_K (点云用 get_rgbd 的 depth 图, 分辨率与 color 不同)
+                di = cp.depth_intrinsic
+                self._factory_depth_K = np.array([[di.fx, 0.0,    di.cx],
+                                                  [0.0,    di.fy, di.cy],
+                                                  [0.0,    0.0,   1.0   ]], dtype=np.float64)
                 break
         if factory_K is None:
             self.release()
@@ -66,7 +74,28 @@ class OrbbecCamera(Camera):
         # 构造传入的标定值优先 (精度更高); 否则用出厂值。
         self.K = np.asarray(K, dtype=np.float64) if K is not None else factory_K
         self.dist = np.asarray(dist, dtype=np.float64) if dist is not None else factory_dist
+        self.depth_K = self._factory_depth_K   # depth 流内参 (点云反投影用)
         super().__init__()
+
+    def get_point_cloud(self, stride: int = 1):
+        """覆写: 用 depth 流内参 depth_K 反投影 (基类默认用 self.K=rgb 内参, 分辨率不匹配)。"""
+        bgr, depth_mm = self.get_rgbd()
+        fx, fy = self.depth_K[0, 0], self.depth_K[1, 1]
+        cx, cy = self.depth_K[0, 2], self.depth_K[1, 2]
+        depth_m = depth_mm.astype(np.float32) * 0.001
+        h, w = depth_m.shape
+        vv, uu = np.indices((h, w), dtype=np.float32)
+        valid = depth_m > 0
+        if stride > 1:
+            sm = np.zeros_like(valid)
+            sm[::stride, ::stride] = True
+            valid &= sm
+        z = depth_m[valid]
+        x = (uu[valid] - cx) * z / fx
+        y = (vv[valid] - cy) * z / fy
+        points = np.column_stack((x, y, z)).astype(np.float32)
+        colors_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)[valid].astype(np.uint8)
+        return points, colors_rgb
 
     def get_frame(self) -> np.ndarray:
         """返回一帧 BGR uint8 (H, W, 3)。取不到帧返回 None。"""
@@ -76,6 +105,30 @@ class OrbbecCamera(Camera):
                 bgr = _frame_to_bgr(fs.get_color_frame())
                 if bgr is not None:
                     return bgr
+        return None
+
+    def get_rgbd(self):
+        """返回 (bgr uint8 HxWx3, depth_uint16_mm HxW)。
+        color resize 到 depth 分辨率 (depth 流分辨率可能不同), 与基类 get_point_cloud 的 K 对齐。"""
+        for _ in range(30):
+            fs = self._pipe.wait_for_frames(1000)
+            if not fs:
+                continue
+            color_frame = fs.get_color_frame()
+            depth_frame = fs.get_depth_frame()
+            if color_frame is None or depth_frame is None:
+                continue
+            bgr = _frame_to_bgr(color_frame)
+            if bgr is None:
+                continue
+            depth_mm = _frame_to_depth_mm(depth_frame)
+            if depth_mm is None:
+                continue
+            # color 对齐到 depth 尺寸 (K 来自 depth 流内参)。
+            if bgr.shape[:2] != depth_mm.shape:
+                bgr = cv2.resize(bgr, (depth_mm.shape[1], depth_mm.shape[0]),
+                                 interpolation=cv2.INTER_LINEAR)
+            return bgr, depth_mm
         return None
 
     def release(self) -> None:
@@ -103,3 +156,19 @@ def _frame_to_bgr(frame) -> np.ndarray:
         img = np.resize(data, (height, width, 2))
         return cv2.cvtColor(img, cv2.COLOR_YUV2BGR_YUYV)
     return None
+
+
+def _frame_to_depth_mm(frame) -> np.ndarray:
+    """Orbbec depth VideoFrame -> uint16 mm (H, W)。
+    原始数据乘 get_depth_scale() 得到 mm, NaN/Inf->0, clip 到 uint16。"""
+    try:
+        width = frame.get_width()
+        height = frame.get_height()
+        scale = float(frame.get_depth_scale())
+    except Exception:
+        return None
+    raw = np.frombuffer(frame.get_data(), dtype=np.uint16).reshape((height, width))
+    depth_mm = np.nan_to_num(raw.astype(np.float32) * scale, nan=0.0,
+                             posinf=0.0, neginf=0.0)
+    depth_mm = np.clip(depth_mm, 0, np.iinfo(np.uint16).max)
+    return depth_mm.astype(np.uint16)

@@ -7,7 +7,7 @@ Intel RealSense 相机实现 (pyrealsense2, 无 ROS)。
 import numpy as np
 import pyrealsense2 as rs
 
-from camera.camera import Camera
+from .camera import Camera
 
 
 class RealSenseCamera(Camera):

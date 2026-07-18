@@ -1,0 +1,10 @@
+// 机械臂运动指令 (主控发布, 接收端订阅后翻译成 move_pose/move_joint)。
+// 平移单位: 米。t_ee2base 行优先 4x4。
+struct arm_command
+{
+    int64_t  cmd_id;          // 指令 id, 主控自增; 接收端执行完后用相同 id 回 execution_feedback
+    double   t_ee2base[16];   // 末端目标位姿 4x4 (行优先)
+    double   speed;           // 0..1
+    double   accel;           // 0..1
+    boolean  block;           // 是否阻塞到位 (接收端执行完才回 feedback)
+}

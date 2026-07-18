@@ -1,0 +1,9 @@
+// 执行反馈 (接收端发布, 主控订阅)。
+// 接收端执行完一条 arm_command/hand_command 后, 用相同的 cmd_id 回此消息。
+// 主控用它实现阻塞: 发指令 -> 等对应 cmd_id 的 feedback -> 继续。
+struct execution_feedback
+{
+    int64_t  cmd_id;          // 对应所完成指令的 cmd_id
+    boolean  success;         // 是否执行成功
+    string   error;           // 失败时的错误信息 (成功则空)
+}

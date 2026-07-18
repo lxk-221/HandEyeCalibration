@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时生成 (日志/输出)
+Log/
+output/
+
+# LCM/工具本地配置 (按需)
+*.local.yaml

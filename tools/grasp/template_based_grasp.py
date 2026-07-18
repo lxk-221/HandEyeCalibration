@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""
+模板匹配抓取 tool —— 从 RGB-D 出发做 ICP 模板匹配, 算出 arm/hand 目标位姿,
+经 LCM 发布 (不直接控硬件)。
+
+进程边界:
+    本 tool (toolbox 内, 纯净, 无 ROS)
+      OrbbecCamera.get_point_cloud() 取相机系点云
+      -> pointcloud 模块: 距离过滤 + RANSAC 平面分割 + ICP 模板匹配
+      -> 工件中心 (相机系) 经 T_cam2gripper + T_gripper2base 变到 base 系
+      -> 算 arm 目标位姿 (工件中心 + 固定偏置) + hand 位姿
+      -> LcmCommander 依次发 arm_command / hand_command (阻塞等 execution_feedback)
+    另一个程序 (toolbox 外, 可依赖 ROS): 订阅 LCM -> lx_useful 控硬件 -> 回 feedback
+
+运行:
+    python main.py grasp --workpiece doc/hex_hole.ply --t-gripper2base T.npy
+"""
+import argparse
+import os
+import time
+
+import numpy as np
+
+from .._hardware import get_camera_class
+from . import pointcloud as pc
+from .lcm_commander import LcmCommander
+
+
+# 写死的手眼标定 T_cam2gripper (来自 tools/hand_eye 标定结果; 参考 demo.py 的 T_CAM2GRIPPER)。
+# 后续换相机/机械臂需重新标定并改这里。平移单位米。
+T_CAM2GRIPPER = np.array(
+    [
+        [0.0008, -0.9982, -0.0603, 0.071329],
+        [-0.9995, 0.0011, -0.0317, 0.0092383],
+        [0.0317, 0.0603, -0.9977, -0.0312081],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+# 抓取位姿偏置 (参考 xyz_bak client 的 execute_control_pose, base 系):
+#   arm 目标 = 工件中心 + 这组偏置; rpy 固定 (从上方斜抓)。
+APPROACH_OFFSET_M = np.array([-0.07, 0.022, 0.23], dtype=np.float64)
+APPROACH_RPY_RAD = np.array([-55.0, 0.0, 90.0]) * np.pi / 180.0
+HAND_DOF = 6
+HAND_READY = [255, 10, 255, 255, 255, 255]      # 张开待命
+HAND_GRASP = [0, 5, 70, 80, 80, 70]             # 抓取
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="模板匹配抓取 (ICP) + LCM 发布")
+    ap.add_argument("--workpiece", required=True,
+                    help="工件模板点云 .ply 路径 (ICP source)")
+    ap.add_argument("--t-gripper2base", default=None,
+                    help="拍照时刻 T_gripper2base 4x4, .npy 或 16 个数的逗号串; "
+                         "缺省用单位阵 (需真实值才能算对 base 系位姿)")
+    ap.add_argument("--icp-distance", type=float, default=0.012,
+                    help="ICP 最大对应距离 (m)")
+    ap.add_argument("--icp-iter", type=int, default=80, help="ICP 最大迭代")
+    ap.add_argument("--depth-min", type=float, default=0.3, help="距离过滤最小 (m)")
+    ap.add_argument("--depth-max", type=float, default=1.2, help="距离过滤最大 (m)")
+    ap.add_argument("--plane-thresh", type=float, default=0.004, help="RANSAC 平面阈值 (m)")
+    ap.add_argument("--lcm-url", default="udpm://224.0.0.1?ttl=0",
+                    help="LCM 地址 (ttl=0 仅本机; 跨机用 ttl=1+ 多播)")
+    ap.add_argument("--arm-timeout", type=float, default=60.0,
+                    help="单条 arm 指令等 feedback 超时 (s)")
+    ap.add_argument("--hand-timeout", type=float, default=3.0,
+                    help="单条 hand 指令等 feedback 超时 (s)")
+    ap.add_argument("--no-send", action="store_true", help="只算不发 LCM (调试)")
+    return ap.parse_args(argv)
+
+
+def _load_T_gripper2base(arg):
+    """从 --t-gripper2base 参数构造 4x4。支持 .npy 文件或 16 个数的逗号串。缺省单位阵。"""
+    if arg is None:
+        print("[警告] 未提供 --t-gripper2base, 用单位阵 (base 系位姿将无意义, 仅用于调通)")
+        return np.eye(4, dtype=np.float64)
+    if os.path.exists(arg):
+        return np.asarray(np.load(arg), dtype=np.float64).reshape(4, 4)
+    vals = [float(v) for v in arg.split(",")]
+    return np.array(vals, dtype=np.float64).reshape(4, 4)
+
+
+def run_pipeline(args):
+    """主流程: 取点云 -> 预处理 + ICP -> 工件位姿(base系) -> arm/hand 指令 -> LCM 发布。"""
+    # 1. 手眼标定 (T_cam2gripper 写死) + 拍照时刻位姿 (T_gripper2base) -> camera2base。
+    T_gripper2base = _load_T_gripper2base(args.t_gripper2base)
+    T_camera2base = pc.camera_to_base_transform(T_gripper2base, T_CAM2GRIPPER)
+
+    # 2. 取相机系点云 (经 toolbox camera 抽象, 懒加载)。
+    CameraCls = get_camera_class()
+    if CameraCls is None:
+        raise RuntimeError("config.yaml 未配置 camera, 无法取点云")
+    print(f"=== 模板匹配抓取 (camera={CameraCls.__name__}) ===")
+    cam = CameraCls()
+    try:
+        points_cam, colors_cam = cam.get_point_cloud()
+        print(f"取到点云: {len(points_cam)} 点 (相机系, m)")
+        if len(points_cam) == 0:
+            raise RuntimeError("点云为空")
+
+        # 3. 预处理: 距离过滤 + RANSAC 去平面。
+        keep = pc.distance_filter_point_cloud(points_cam, args.depth_min, args.depth_max, mode="z")
+        pts = points_cam[keep]
+        print(f"距离过滤后: {len(pts)} 点")
+        pts, _cols, _keep2, plane_model, _inlier, _greater = \
+            pc.ransac_remove_plane_and_greater_z(pts, pts, args.plane_thresh)
+        print(f"RANSAC 去平面后: {len(pts)} 点")
+        if len(pts) < 50:
+            raise RuntimeError(f"分割后点太少 ({len(pts)}), 无法做模板匹配")
+
+        # 4. ICP 模板匹配: 模板(source) 配准到场景物体(target)。
+        match = pc.match_workpiece_point_cloud(
+            pts, args.workpiece, args.icp_distance, args.icp_iter)
+        center_cam = match.aligned_points.mean(axis=0)
+        print(f"工件中心 (相机系): {np.round(center_cam, 4).tolist()}")
+
+        # 5. 工件中心 -> base 系。
+        center_base = pc.transform_points_to_base(center_cam[None, :], T_camera2base)[0]
+        print(f"工件中心 (base 系): {np.round(center_base, 4).tolist()}")
+
+        # 6. 算 arm 目标位姿 (工件中心 + 固定偏置) + hand 位姿。
+        arm_xyz = center_base + APPROACH_OFFSET_M
+        from scipy.spatial.transform import Rotation as Rot
+        arm_T = np.eye(4, dtype=np.float64)
+        arm_T[:3, :3] = Rot.from_euler("xyz", APPROACH_RPY_RAD).as_matrix()
+        arm_T[:3, 3] = arm_xyz
+        print(f"arm 目标位姿 (base 系): xyz={np.round(arm_xyz, 4).tolist()} "
+              f"rpy_deg={np.round(np.degrees(APPROACH_RPY_RAD), 1).tolist()}")
+
+        # 7. LCM 发指令: 先张手 -> 移臂到位 -> 抓取 (每步阻塞等接收端 feedback)。
+        if args.no_send:
+            print("[--no-send] 不发 LCM")
+            return
+        print("=== 通过 LCM 发送运动指令 (阻塞等接收端 feedback) ===")
+        with LcmCommander(lcm_url=args.lcm_url) as cmd:
+            cmd.move_hand(HAND_READY, timeout=args.hand_timeout)
+            print("  [1/3] hand 张开 OK")
+            cmd.move_arm(arm_T, speed=0.8, accel=0.8, timeout=args.arm_timeout)
+            print("  [2/3] arm 到位 OK")
+            cmd.move_hand(HAND_GRASP, timeout=args.hand_timeout)
+            print("  [3/3] hand 抓取 OK")
+        print("=== 抓取流程完成 ===")
+    finally:
+        cam.release()
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    run_pipeline(args)
+
+
+if __name__ == "__main__":
+    main()
