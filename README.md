@@ -28,7 +28,8 @@ BasicToolBox/
         ├── template_based_grasp.py  # 编排: 取点云->ICP匹配->算位姿->发LCM指令
         ├── pointcloud.py     # 从 demo.py 提取的点云处理 + ICP (无 graspnet)
         ├── lcm_commander.py  # LCM 主控侧收发 (cmd_id 阻塞等 feedback)
-        └── lcm_types/        # lcm-gen 生成的消息 (arm/hand/feedback, 独立无嵌套)
+        ├── lcm_types/        # lcm-gen 生成的消息 (arm/hand/feedback/ee_pose, 独立无嵌套)
+        └── templates/        # 工件模板点云 (*.ply, 不纳入 git, 仅本地)
 ```
 
 ## Installation

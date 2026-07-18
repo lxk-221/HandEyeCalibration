@@ -1,0 +1,2 @@
+# 工件模板点云放这里 (*.ply 不纳入 git, 仅本地)。
+# 用法: python main.py grasp --workpiece tools/grasp/templates/xxx.ply

@@ -36,7 +36,8 @@ T_CAM2GRIPPER = np.array(
 )
 
 # ---- 扫描位姿 (4x4 T_ee2base, base 系): 多视角取点云拼合, 克服单帧遮挡 ----
-# 当前为占位 (单位阵), 实际需根据机器人工作空间填入多个观察位姿。
+# 第一个位姿沿用 xyz_bak client 的拍照位 (camera_graspnet_rpc_client.py:451-452, 已验证可达)。
+# 多视角扫描需根据机器人工作空间 + 工件位置补充更多位姿。
 def _scan_pose(xyz, rpy_deg):
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = Rot.from_euler("xyz", rpy_deg, degrees=True).as_matrix()

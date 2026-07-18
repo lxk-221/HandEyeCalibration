@@ -11,3 +11,4 @@ output/
 
 # LCM/工具本地配置 (按需)
 *.local.yaml
+tools/grasp/templates/*.ply
