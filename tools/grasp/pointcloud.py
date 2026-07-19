@@ -68,9 +68,10 @@ def range_filter(points, colors=None,
 # ============================================================================
 def ransac_filter_plane(points, colors=None,
                         distance_thresh=0.004, ransac_n=3, ransac_iter=1000,
-                        min_inlier_ratio=0.05, remove_above=True):
-    """RANSAC 拟合一个平面, 去掉平面内点 (remove_above=True 时还去平面之上的点)。
-    典型用途: 去桌面 (桌面是最大平面, 物体在桌面之上)。
+                        min_inlier_ratio=0.05, remove_below=True):
+    """RANSAC 拟合一个平面 (通常是桌面), 去掉平面内点;
+    remove_below=True 时还去掉平面【下方】的点 (保留桌面之上的物体)。
+    base 系下桌面是大平面, 物体在桌面之上 -> 默认 remove_below=True 保留物体。
     inlier_ratio < min_inlier_ratio 时认为没找到有效平面, 不过滤 (原样返回)。
     返回 (points_keep, colors_keep, plane_model)。plane_model=[a,b,c,d], ax+by+cz+d=0。"""
     pts = np.asarray(points, dtype=np.float64)
@@ -87,12 +88,12 @@ def ransac_filter_plane(points, colors=None,
     plane_inlier_mask = np.zeros(len(pts), dtype=bool)
     plane_inlier_mask[inliers] = True
     a, b, c, d = [float(v) for v in plane_model]
-    if remove_above and abs(c) > 1e-9:
+    if remove_below and abs(c) > 1e-9:
         z_plane = -(a * pts[:, 0] + b * pts[:, 1] + d) / c
-        above_mask = pts[:, 2] > z_plane
+        below_mask = pts[:, 2] <= z_plane   # 平面及下方
     else:
-        above_mask = np.zeros(len(pts), dtype=bool)
-    keep = ~(plane_inlier_mask | above_mask)
+        below_mask = np.zeros(len(pts), dtype=bool)
+    keep = ~(plane_inlier_mask | below_mask)
     out_cols = np.asarray(colors)[keep] if colors is not None and len(colors) == len(pts) else None
     return pts[keep], out_cols, plane_model
 
