@@ -73,8 +73,69 @@ APPROACH_OFFSET_M = np.array([-0.07, 0.022, 0.23], dtype=np.float64)
 APPROACH_RPY_RAD = np.array([-55.0, 0.0, 90.0]) * np.pi / 180.0
 HAND_READY = [255, 10, 255, 255, 255, 255]      # 张开待命
 HAND_GRASP = [0, 5, 70, 80, 80, 70]             # 抓取
+HAND_RELEASE = [255, 5, 255, 255, 255, 255]     # 松手放置
 ARM_SPEED, ARM_ACCEL = 0.8, 0.8
 ARM_TIMEOUT, HAND_TIMEOUT = 60.0, 3.0
+
+# ---- 工件真实厚度 (模板只有 5mm 薄层, 但真实厚度用于匹配后下降到工件中心抓取) ----
+# 按 --workpiece 的文件名 (basename, 不含扩展名) 匹配。未列出的厚度默认 5mm。
+NUT_THICKNESS_M = {
+    "hex_hole_40mm_45mm_35mm": 0.035,   # 大螺母, 真实厚度 35mm
+    "hex_hole_30mm_35mm":      0.028,   # 中螺母, 真实厚度 28mm
+    "hex_hole_24mm_27mm_M27":  0.022,   # 小螺母 M27, 真实厚度 22mm
+}
+
+
+def _workpiece_thickness(workpiece_path):
+    """按文件名查工件真实厚度 (m)。未登记返回模板厚度 5mm。"""
+    import os
+    key = os.path.splitext(os.path.basename(workpiece_path))[0]
+    return NUT_THICKNESS_M.get(key, 0.005)
+
+# ---- 放置序列 (抓取后、cooldown 前; 参考 xyz_bak client execute_control_pose) ----
+# 每项形如:
+#   {"hand": [6 个 0..255]}                发 hand 指令 (阻塞)
+#   {"arm": [x,y,z], "rpy_deg": [r,p,y]}   发 arm 位姿指令 (阻塞)
+#   {"rel": [dx,dy,dz]}                    相对当前位姿平移 (基于最近 arm 位姿)
+# 抓取后流程: 抬起 -> 移到放置位上方 -> 下降 -> 松手 -> 抬回上方。
+PLACE_ABOVE_XYZ = np.array([0.262, -0.09, 0.0], dtype=np.float64)   # 放置位 xy + 占位 z
+PLACE_ABOVE_RPY_DEG = np.array([-60.0, 0.0, 145.0])
+PLACE_DESCEND_M = 0.14     # 放置时从上方下降高度
+RAISE_M = 0.15             # 抓取后抬起 / 松手后抬回
+
+
+def _make_place_sequence(grasp_arm_T):
+    """根据抓取位姿构造放置动作序列 (抓取后抬起 -> 放置位 -> 松手 -> 抬回)。
+    grasp_arm_T: 抓取时的 arm 位姿 (用于确定抬起后的 z)。"""
+    # 抓取后从抓取位抬起 (沿 base z +RAISE_M), 保持抓取 rpy
+    lift_T = grasp_arm_T.copy()
+    lift_T[2, 3] += RAISE_M
+    # 放置位上方 (固定 xy + 抬起后的 z)
+    place_above_T = np.eye(4, dtype=np.float64)
+    place_above_T[:3, :3] = Rot.from_euler("xyz", PLACE_ABOVE_RPY_DEG, degrees=True).as_matrix()
+    place_above_T[:3, 3] = [PLACE_ABOVE_XYZ[0], PLACE_ABOVE_XYZ[1], lift_T[2, 3]]
+    # 放置点 (上方下降 PLACE_DESCEND_M)
+    place_T = place_above_T.copy()
+    place_T[2, 3] -= PLACE_DESCEND_M
+    return [
+        {"arm_T": lift_T},             # 1. 抓取后抬起
+        {"arm_T": place_above_T},      # 2. 移到放置位上方
+        {"arm_T": place_T},            # 3. 下降到放置点
+        {"hand": HAND_RELEASE},        # 4. 松手
+        {"arm_T": place_above_T},      # 5. 抬回放置位上方
+    ]
+
+
+def run_place_sequence(cmd, place_seq):
+    """执行放置动作序列 (每项阻塞等桥 feedback)。"""
+    for i, step in enumerate(place_seq, 1):
+        if "hand" in step:
+            print(f"  place [{i}/{len(place_seq)}] hand={step['hand']}")
+            cmd.move_hand(step["hand"], timeout=HAND_TIMEOUT)
+        elif "arm_T" in step:
+            T = step["arm_T"]
+            print(f"  place [{i}/{len(place_seq)}] arm xyz={np.round(T[:3,3],3).tolist()}")
+            cmd.move_arm(T, speed=ARM_SPEED, accel=ARM_ACCEL, timeout=ARM_TIMEOUT)
 
 
 def scan_point_clouds(cmd, cam, scan_poses):
@@ -151,8 +212,12 @@ def main(argv=None):
             center_base = match.aligned_points.mean(axis=0)
             print(f"工件中心 (base 系): {np.round(center_base, 4).tolist()}")
 
-            # 4. 算 arm 目标位姿 (工件中心 + 固定偏置)。
-            arm_xyz = center_base + APPROACH_OFFSET_M
+            # 4. 算 arm 目标位姿。模板是 5mm 薄层 (上表面), 真实厚度中心在其下方,
+            #    抓取时手要下降到真实厚度中心 -> arm_z 减去 (真实厚度/2 - 模板厚度/2)。
+            thickness = _workpiece_thickness(args.workpiece)
+            center_real = center_base.copy()
+            center_real[2] -= max(0.0, thickness / 2 - 0.0025)   # 模板薄层厚 5mm -> 半厚 2.5mm
+            arm_xyz = center_real + APPROACH_OFFSET_M
             arm_T = np.eye(4, dtype=np.float64)
             arm_T[:3, :3] = Rot.from_euler("xyz", APPROACH_RPY_RAD).as_matrix()
             arm_T[:3, 3] = arm_xyz
@@ -165,6 +230,7 @@ def main(argv=None):
             print(f"  ICP fitness = {info.get('fitness', '?'):.4f}   "
                   f"rmse = {info.get('rmse', '?'):.5f} m")
             print(f"  场景点 {info.get('segmented_points', '?')} <- 模板点 {info.get('model_points', '?')}")
+            print(f"  工件真实厚度: {thickness*1000:.0f}mm (模板为 5mm 薄层, 已按厚度中心调整抓取 z)")
             print(f"  工件中心 (base 系): {np.round(center_base, 4).tolist()} m")
             print(f"  arm 目标位姿 (base 系):")
             print(f"    xyz     = {np.round(arm_xyz, 4).tolist()} m")
@@ -185,10 +251,15 @@ def main(argv=None):
             cmd.move_hand(HAND_GRASP, timeout=HAND_TIMEOUT)
             print("  [3/3] hand 抓取 OK")
 
-            # 7. COOLDOWN: 关节空间从扫描位回到零位 (WARMUP 倒序)。
-            print("=== COOLDOWN (扫描位 -> 零位) ===")
+            # 7. 放置: 抓取后抬起 -> 放置位 -> 松手 -> 抬回 (每步阻塞等桥 feedback)。
+            print("=== 放置 (抓取位 -> 放置位 -> 松手) ===")
+            place_seq = _make_place_sequence(arm_T)
+            run_place_sequence(cmd, place_seq)
+
+            # 8. COOLDOWN: 关节空间从扫描位回到零位 (WARMUP 倒序)。
+            print("=== COOLDOWN (放置位 -> 零位) ===")
             run_joint_sequence(cmd, COOLDOWN_JOINTS, "cooldown")
-            print("=== 抓取流程完成 ===")
+            print("=== 抓取+放置流程完成 ===")
     finally:
         cam.release()
 
