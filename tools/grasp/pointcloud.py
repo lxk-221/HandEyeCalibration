@@ -193,25 +193,11 @@ def _to_pcd(points, colors=None, default_color=(0.7, 0.7, 0.7)):
 
 
 def _show_with_picking(geometries, title, point_size=5.0):
-    """弹窗显示, shift+左键选点 -> 终端打印本次新选点坐标 (米)。关闭窗口继续。
-    point_size: 渲染点大小 (默认 5, VisualizerWithVertexSelection 默认 1 太小看不见)。"""
-    viz = o3d.visualization.VisualizerWithVertexSelection()
-    viz.create_window(window_name=title)
-    for g in geometries:
-        viz.add_geometry(g)
-    # 关键: 默认点大小=1 几乎看不见, 调大 (原程序 draw_geometries 默认较大)
-    viz.get_render_option().point_size = point_size
-    _last_count = [0]
-
-    def _on_changed():
-        picked = viz.get_picked_points()
-        for p in picked[_last_count[0]:]:
-            print(f"  拾取点 (m): [{p.coord[0]:.4f}, {p.coord[1]:.4f}, {p.coord[2]:.4f}]")
-        _last_count[0] = len(picked)
-
-    viz.register_selection_changed_callback(_on_changed)
-    viz.run()
-    viz.destroy_window()
+    """弹窗显示点云。关闭窗口后返回 (阻塞)。
+    用 draw_geometries (与原 client visualize_rpc_debug.py 一致, 渲染最可靠)。
+    可视化时按 n 打开全局设置面板可调点大小; shift+右键拖动旋转, 滚轮缩放。"""
+    o3d.visualization.draw_geometries(geometries, window_name=title,
+                                      point_size=point_size)
 
 
 def show_pointcloud(points, colors=None, title="point cloud", center=None, frame_size=0.5):
