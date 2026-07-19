@@ -270,15 +270,12 @@ def voxel_downsample(points, colors, voxel_size):
 
 
 def segment_workpiece_from_base(points_base, colors_base,
-                                distance_min_m=0.3, distance_max_m=1.2,
+                                x_min_m=0.4, z_min_m=-0.55,
                                 plane_thresh_m=0.004):
-    """base 系点云的分割: 距离过滤 (到 base 原点的半径) + RANSAC 去平面。
-    把点云处理的默认参数集中在此 (避免散落到主程序的 argparse)。
+    """base 系点云的分割: 范围过滤 (x > x_min 且 z > z_min) + RANSAC 去平面。
     返回 (points_seg, colors_seg)。"""
     points_base = np.asarray(points_base, dtype=np.float64)
-    # 距离过滤: base 系下用到原点的半径 (xy 主要分布范围)
-    radius = np.linalg.norm(points_base[:, :2], axis=1)
-    keep = (radius >= distance_min_m) & (radius <= distance_max_m)
+    keep = (points_base[:, 0] > x_min_m) & (points_base[:, 2] > z_min_m)
     pts = points_base[keep]
     cols = np.asarray(colors_base)[keep] if colors_base is not None else None
     # RANSAC 去平面 (桌面): base 系下桌面近似 z=const, segment_plane 仍适用
@@ -304,15 +301,21 @@ def _show_with_picking(geometries, title):
     """弹窗显示点云, 支持 shift+左键拾取点并打印其坐标 (base 系, 米)。
     用 VisualizerWithVertexSelection (open3d 0.19 移除了 PointCloudPicker, 这是替代)。
     关闭窗口后返回 (阻塞)。
-    操作: shift+左键选点 (可多选), 终端实时打印选中点坐标; 关闭窗口继续。"""
+    操作: shift+左键选点, 每次只打印本次新选点的坐标; 关闭窗口继续。"""
     viz = o3d.visualization.VisualizerWithVertexSelection()
     viz.create_window(window_name=title)
     for g in geometries:
         viz.add_geometry(g)
-    viz.register_selection_changed_callback(
-        lambda: [print(f"  拾取点 (base, m): "
-                       f"[{p.coord[0]:.4f}, {p.coord[1]:.4f}, {p.coord[2]:.4f}]")
-                 for p in viz.get_picked_points()])
+    _last_count = [0]   # 闭包记录上次已选点数, 只打印新增的
+
+    def _on_changed():
+        picked = viz.get_picked_points()
+        # 只打印本次新加的点 (跳过之前已选的)
+        for p in picked[_last_count[0]:]:
+            print(f"  拾取点 (base, m): [{p.coord[0]:.4f}, {p.coord[1]:.4f}, {p.coord[2]:.4f}]")
+        _last_count[0] = len(picked)
+
+    viz.register_selection_changed_callback(_on_changed)
     viz.run()
     viz.destroy_window()
 
