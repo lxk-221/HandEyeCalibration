@@ -162,7 +162,7 @@ class GraspTemplateBased(Grasp):
         cols = pointcloud[1] if isinstance(pointcloud, tuple) else None
 
         # 分割 = 范围过滤 + RANSAC 去平面 (两步原子, 中间可视化便于调参)
-        pts, cols = pc.range_filter(pts, cols, x_min=0.4, z_min=-0.55)
+        pts, cols = pc.range_filter(pts, cols, x_min=0.2, z_min=-0.55)
         print(f"  范围过滤后 {len(pts)} 点")
         pc.show_pointcloud(pts, cols, title="[3] 范围过滤后")
         pts, cols, _plane = pc.ransac_filter_plane(pts, cols)

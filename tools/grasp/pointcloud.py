@@ -211,8 +211,8 @@ def _show_with_picking(geometries, title):
     viz.destroy_window()
 
 
-def show_pointcloud(points, colors=None, title="point cloud", center=None, frame_size=0.2):
-    """显示单一点云 + base 坐标轴 (红x 绿y 蓝z)。center: 白球标注点。"""
+def show_pointcloud(points, colors=None, title="point cloud", center=None, frame_size=0.5):
+    """显示单一点云 + base 坐标轴 (红x 绿y 蓝z, 原点=base)。center: 白球标注点。"""
     geos = [_to_pcd(points, colors),
             o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size)]
     if center is not None:
@@ -220,20 +220,20 @@ def show_pointcloud(points, colors=None, title="point cloud", center=None, frame
         sph.translate(np.asarray(center, dtype=np.float64))
         sph.paint_uniform_color([1.0, 1.0, 1.0])
         geos.append(sph)
-    print(f"[{title}] shift+左键拾取点; 关闭窗口继续")
+    print(f"[{title}] 红x 绿y 蓝z=base坐标系; shift+左键拾取点; 关闭窗口继续")
     _show_with_picking(geos, title)
 
 
 def show_match(scene_points, scene_colors, workpiece_points,
-               workpiece_color=(0.05, 0.85, 0.20), center=None, title="ICP match"):
-    """场景(原色/灰) + 工件模板(绿) + 坐标轴 + 工件中心黄球。"""
+               workpiece_color=(1.0, 0.1, 0.1), center=None, title="ICP match"):
+    """场景(原色/灰) + 工件模板(亮红) + base 坐标轴 + 工件中心黄球。"""
     geos = [_to_pcd(scene_points, scene_colors),
             _to_pcd(workpiece_points, default_color=workpiece_color),
-            o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)]
+            o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)]
     if center is not None:
         sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
         sph.translate(np.asarray(center, dtype=np.float64))
         sph.paint_uniform_color([1.0, 1.0, 0.0])
         geos.append(sph)
-    print(f"[{title}] 绿=模板 灰=场景 黄球=工件中心; shift+左键拾取点; 关闭继续")
-    _show_with_picking(geos, f"{title} (绿=模板 灰=场景 黄球=工件中心)")
+    print(f"[{title}] 亮红=模板 灰=场景 黄球=工件中心 红x绿y蓝z=base; shift+左键拾取点; 关闭继续")
+    _show_with_picking(geos, f"{title} (红=模板 灰=场景)")
