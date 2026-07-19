@@ -133,27 +133,72 @@ class MatchResult:
     info: dict = field(default_factory=dict)
 
 
+def _downsample_and_fpfh(pcd, voxel_size):
+    """降采样 + 估法向 + 算 FPFH 特征。返回 (downsampled_pcd, fpfh_feature)。
+    FPFH 需要法向; 降采样让特征计算更快更稳。"""
+    pcd_ds = pcd.voxel_down_sample(voxel_size)
+    radius_normal = voxel_size * 2.0
+    pcd_ds.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+    radius_feature = voxel_size * 5.0
+    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_ds,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+    return pcd_ds, fpfh
+
+
 def icp_match(scene_points, template_path,
-              max_correspondence_distance=0.012, icp_iteration=80):
-    """把完整模板点云 (source) ICP 配准到场景物体点 (target)。
-    scene_points: (N,3) 米 (与输出同坐标系)。template_path: .ply 模板。
-    返回 MatchResult。aligned_points 中心 = 物体中心 (在该坐标系下)。"""
+              max_correspondence_distance=0.012, icp_iteration=80,
+              voxel_feature=None, ransac_n=4000000):
+    """FPFH 全局配准 + ICP 精配 (解决多物体场景下质心初始化跑偏的问题)。
+
+    流程:
+      1. 模板/场景降采样 + 算 FPFH 特征 (描述局部几何形状)
+      2. RANSAC 全局配准: 用 FPFH 特征匹配找模板在场景的大致位置 (不需初值)
+      3. ICP 精配: 用全局结果作初值, 精细对齐
+
+    scene_points: (N,3) 米。template_path: .ply 模板。
+    voxel_feature: FPFH 降采样粒度 (米), None=模板直径的 1/5。
+    ransac_n: RANSAC 采样次数 (越大越稳越慢)。
+    返回 MatchResult。"""
     pts = np.asarray(scene_points, dtype=np.float64)
     if len(pts) == 0:
-        raise ValueError("场景点云为空, 无法 ICP 匹配")
+        raise ValueError("场景点云为空, 无法匹配")
     if not os.path.exists(template_path):
         raise FileNotFoundError(f"模板不存在: {template_path}")
     source = o3d.io.read_point_cloud(template_path)
     if len(source.points) == 0:
         raise ValueError(f"模板点云为空: {template_path}")
-
     target = o3d.geometry.PointCloud()
     target.points = o3d.utility.Vector3dVector(pts)
-    # 初始变换: 质心对齐
-    init = np.eye(4, dtype=np.float64)
-    init[:3, 3] = pts.mean(0) - np.asarray(source.points).mean(0)
+
+    # FPFH 降采样粒度: 默认 5mm (工件多在 5~8cm 量级, 5mm 能保留足够点算特征)。
+    # 太大会把稀疏模板降到几十点, FPFH 不稳定; 太小则场景特征计算慢。
+    voxel_size = float(voxel_feature) if voxel_feature else 0.005
+    print(f"  FPFH 全局配准: voxel={voxel_size*1000:.1f}mm")
+
+    # 1. 降采样 + FPFH 特征
+    source_ds, source_fpfh = _downsample_and_fpfh(source, voxel_size)
+    target_ds, target_fpfh = _downsample_and_fpfh(target, voxel_size)
+    print(f"    模板 {len(source_ds.points)} 点 (降采样后), 场景 {len(target_ds.points)} 点")
+
+    # 2. RANSAC 全局配准 (FPFH 特征匹配, 找模板在场景的大致位置)
+    distance_threshold_global = voxel_size * 1.5
+    result_global = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source_ds, target_ds, source_fpfh, target_fpfh, True,
+        distance_threshold_global,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        3,
+        [
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold_global)
+        ],
+        o3d.pipelines.registration.RANSACConvergenceCriteria(ransac_n, 0.999))
+    print(f"    全局 RANSAC: fitness={result_global.fitness:.4f} rmse={result_global.inlier_rmse:.5f}")
+
+    # 3. ICP 精配 (用全局结果作初值)
     result = o3d.pipelines.registration.registration_icp(
-        source, target, max_correspondence_distance, init,
+        source, target, max_correspondence_distance, result_global.transformation,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
         o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(icp_iteration)))
 
@@ -167,12 +212,13 @@ def icp_match(scene_points, template_path,
     info = {
         "fitness": float(result.fitness),
         "rmse": float(result.inlier_rmse),
+        "global_fitness": float(result_global.fitness),
         "scene_points": int(len(pts)),
         "model_points": int(len(aligned_points)),
     }
-    print(f"  ICP: {len(pts)} 场景点 <- {len(aligned_points)} 模板点, "
+    print(f"  ICP 精配: {len(pts)} 场景点 <- {len(aligned_points)} 模板点, "
           f"fitness={info['fitness']:.4f} rmse={info['rmse']:.5f}")
-    # 诊断: 配准后模板 + 场景的 bbox, 看是否重合 (不重合 = ICP 失败, 模板飞走)
+    # 诊断: 配准后模板 + 场景的 bbox, 看是否重合
     print(f"    场景 bbox: [{np.round(pts.min(0),3).tolist()} ~ {np.round(pts.max(0),3).tolist()}]")
     print(f"    模板 bbox: [{np.round(aligned_points.min(0),3).tolist()} ~ {np.round(aligned_points.max(0),3).tolist()}]")
     return MatchResult(aligned_points, aligned_colors,
