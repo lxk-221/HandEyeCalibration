@@ -230,8 +230,15 @@ def show_pointcloud(points, colors=None, title="point cloud", center=None, frame
 def show_match(scene_points, scene_colors, workpiece_points,
                workpiece_color=(1.0, 0.1, 0.1), center=None, title="ICP match"):
     """场景(原色/灰) + 工件模板(亮红) + base 坐标轴 + 工件中心黄球。"""
+    scene_points = np.asarray(scene_points, dtype=np.float64)
+    workpiece_points = np.asarray(workpiece_points, dtype=np.float64)
+    # 诊断: 打印两者 bbox, 不重合 = ICP 失败/模板飞走 (看不到红点的常见原因)
+    if len(scene_points) and len(workpiece_points):
+        print(f"  [诊断] 场景 bbox: {np.round(scene_points.min(0),3).tolist()} ~ {np.round(scene_points.max(0),3).tolist()} ({len(scene_points)} 点)")
+        print(f"  [诊断] 模板 bbox: {np.round(workpiece_points.min(0),3).tolist()} ~ {np.round(workpiece_points.max(0),3).tolist()} ({len(workpiece_points)} 点)")
+    wp_pcd = _to_pcd(workpiece_points, default_color=workpiece_color)
     geos = [_to_pcd(scene_points, scene_colors),
-            _to_pcd(workpiece_points, default_color=workpiece_color),
+            wp_pcd,
             o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)]
     if center is not None:
         sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)

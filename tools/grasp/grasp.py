@@ -64,6 +64,7 @@ class GraspTemplateBased(Grasp):
     HAND_READY = [255, 10, 255, 255, 255, 255]
     HAND_GRASP = [0, 5, 70, 80, 80, 70]
     HAND_RELEASE = [255, 5, 255, 255, 255, 255]
+    HAND_INIT = [255, 255, 255, 255, 255, 255]
     ARM_SPEED, ARM_ACCEL = 0.8, 0.8
     ARM_TIMEOUT, HAND_TIMEOUT = 60.0, 3.0
     # approach 预置高度 (相对 grasp_pose 上方), approach 时先到这里再下降
@@ -94,16 +95,20 @@ class GraspTemplateBased(Grasp):
 
     # ---------------- 生命周期 ----------------
     def warm_up(self):
-        """关节空间从零位移动到扫描位附近 (避奇异/碰撞)。"""
+        """手复位 -> 关节空间从零位移动到扫描位附近 (避奇异/碰撞)。"""
         print("=== warm_up ===")
+        print(f"  hand INIT {self.HAND_INIT}")
+        self.hand.move_hand(self.HAND_INIT, timeout=self.HAND_TIMEOUT)
         for i, j in enumerate(self.warmup_joints, 1):
             print(f"  [{i}/{len(self.warmup_joints)}] {np.round(j,3).tolist()}")
             self.arm.move_joints(j, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
                                  timeout=self.ARM_TIMEOUT)
 
     def cool_down(self):
-        """关节空间回零位 (warm_up 倒序)。"""
+        """手复位 -> 关节空间回零位 (warm_up 倒序)。"""
         print("=== cool_down ===")
+        print(f"  hand INIT {self.HAND_INIT}")
+        self.hand.move_hand(self.HAND_INIT, timeout=self.HAND_TIMEOUT)
         for i, j in enumerate(self.cooldown_joints, 1):
             print(f"  [{i}/{len(self.cooldown_joints)}] {np.round(j,3).tolist()}")
             self.arm.move_joints(j, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
