@@ -46,8 +46,8 @@ def _scan_pose(xyz, rpy_deg):
 
 SCAN_POSES = [
     #_scan_pose([0.394, -0.292, -0.223], [-2.4, 2.4, 90.7]), # real example, dont delete
-    _scan_pose([0.394, -0.292, -0.223], [0, 0, 90]),
-    _scan_pose([0.350, -0.292, -0.223], [0, 0, 90]),
+    _scan_pose([0.400, -0.300, -0.223], [0, 0, 90]),
+    _scan_pose([0.350, -0.300, -0.223], [0, 0, 90]),
     # 可继续添加更多视角...
 ]
 VOXEL_SIZE_M = 0.002          # 多帧拼合后体素降采样粒度
@@ -127,15 +127,23 @@ def main(argv=None):
             if not frames:
                 raise RuntimeError("所有扫描位姿都没取到点云")
 
-            # 2. 多帧拼合到 base 系 + voxel 下采样 + 分割 (去桌面)。
+            # 2. 多帧拼合到 base 系 + voxel 下采样 + 分割 (去桌面)。每步可视化 (调参用)。
             pts_base, cols_base = pc.merge_frames_to_base(frames, T_CAM2GRIPPER)
             print(f"多帧拼合 (base 系): {len(pts_base)} 点")
+            if not args.yes:
+                pc.show_pointcloud(pts_base, cols_base, title="[1] 拼合后 (base系)")
+
             pts_base, cols_base = pc.voxel_downsample(pts_base, cols_base, VOXEL_SIZE_M)
             print(f"voxel 下采样 ({VOXEL_SIZE_M*1000}mm): {len(pts_base)} 点")
+            if not args.yes:
+                pc.show_pointcloud(pts_base, cols_base, title="[2] voxel 下采样后")
+
             pts_seg, cols_seg = pc.segment_workpiece_from_base(pts_base, cols_base)
             print(f"分割后: {len(pts_seg)} 点")
             if len(pts_seg) < 50:
                 raise RuntimeError(f"分割后点太少 ({len(pts_seg)}), 无法做模板匹配")
+            if not args.yes:
+                pc.show_pointcloud(pts_seg, cols_seg, title="[3] 分割后 (去桌面)")
 
             # 3. ICP 模板匹配 (场景点已在 base 系, 模板配准到 base 系)。
             match = pc.match_workpiece_point_cloud(
@@ -151,7 +159,7 @@ def main(argv=None):
 
             # 5. 人工确认: 点云可视化 + 打印匹配结果, 确认后再执行 (安全)。
             if not args.yes:
-                pc.show_match(pts_seg, cols_seg, match.aligned_points)
+                pc.show_match(pts_seg, cols_seg, match.aligned_points, center=center_base)
             info = match.info
             print("\n========== 模板匹配结果 ==========")
             print(f"  ICP fitness = {info.get('fitness', '?'):.4f}   "

@@ -288,23 +288,46 @@ def segment_workpiece_from_base(points_base, colors_base,
 
 
 # ---------------- 可视化 ----------------
-def show_match(scene_points, scene_colors, workpiece_points,
-               workpiece_color=(0.05, 0.85, 0.20)):
-    """弹窗显示: 场景点云 (原色/灰) + 工件模板点云 (绿色) 叠加, 直观核对 ICP 匹配。
-    关闭窗口后返回 (阻塞)。
-    - scene_points: (N,3) base 系米; scene_colors: (N,3) uint8 RGB 或 None
-    - workpiece_points: (M,3) base 系米 (已配准); workpiece_color: float (r,g,b) 0..1"""
-    scene = o3d.geometry.PointCloud()
-    scene.points = o3d.utility.Vector3dVector(np.asarray(scene_points, dtype=np.float64))
-    if scene_colors is not None and len(scene_colors) == len(scene_points):
-        scene.colors = o3d.utility.Vector3dVector(
-            np.clip(np.asarray(scene_colors, dtype=np.float64) / 255.0, 0.0, 1.0))
+def _to_pcd(points, colors=None, default_color=(0.7, 0.7, 0.7)):
+    """(N,3) 米 + 可选 (N,3) uint8 RGB -> o3d.geometry.PointCloud。"""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    if colors is not None and len(colors) == len(points):
+        pcd.colors = o3d.utility.Vector3dVector(
+            np.clip(np.asarray(colors, dtype=np.float64) / 255.0, 0.0, 1.0))
     else:
-        scene.paint_uniform_color([0.7, 0.7, 0.7])
+        pcd.paint_uniform_color(default_color)
+    return pcd
 
-    wp = o3d.geometry.PointCloud()
-    wp.points = o3d.utility.Vector3dVector(np.asarray(workpiece_points, dtype=np.float64))
-    wp.paint_uniform_color(workpiece_color)
 
-    o3d.visualization.draw_geometries([scene, wp],
-                                      window_name="ICP match (绿=工件模板, 灰/原色=场景; 关闭继续)")
+def show_pointcloud(points, colors=None, title="point cloud", center=None,
+                    frame_size=0.2):
+    """弹窗显示单一点云 (base 系)。附 base 坐标轴 (红x 绿y 蓝z), 便于对照点云位置。
+    center: 可选 (3,) 标注点, 画一个白球标记。
+    关闭窗口后返回 (阻塞)。注: open3d 默认不显示鼠标悬停点坐标, 靠坐标轴+打印对照。"""
+    geos = [_to_pcd(points, colors)]
+    geos.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size))
+    if center is not None:
+        sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
+        sph.translate(np.asarray(center, dtype=np.float64))
+        sph.paint_uniform_color([1.0, 1.0, 1.0])
+        geos.append(sph)
+    o3d.visualization.draw_geometries(geos, window_name=title)
+
+
+def show_match(scene_points, scene_colors, workpiece_points,
+               workpiece_color=(0.05, 0.85, 0.20), center=None, title="ICP match"):
+    """弹窗显示: 场景点云 (原色/灰) + 工件模板点云 (绿色) 叠加 + base 坐标轴。
+    直观核对 ICP 配准效果与工件在场景中的位置。关闭窗口后返回 (阻塞)。
+    - scene_points: (N,3) base 系米; scene_colors: (N,3) uint8 RGB 或 None
+    - workpiece_points: (M,3) base 系米 (已配准); center: 可选标注点"""
+    geos = [_to_pcd(scene_points, scene_colors),
+            _to_pcd(workpiece_points, default_color=workpiece_color)]
+    geos.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2))
+    if center is not None:
+        sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
+        sph.translate(np.asarray(center, dtype=np.float64))
+        sph.paint_uniform_color([1.0, 1.0, 0.0])   # 黄球标工件中心
+        geos.append(sph)
+    o3d.visualization.draw_geometries(
+        geos, window_name=f"{title} (绿=工件模板, 灰/原色=场景, 黄球=工件中心; 关闭继续)")
