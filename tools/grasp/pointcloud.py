@@ -123,7 +123,47 @@ def voxel_downsample(points, colors=None, voxel_size=0.002):
 
 
 # ============================================================================
-# 5. ICP 模板匹配
+# 5. 欧式聚类 (DBSCAN) — 把空间分离的多个物体分成独立簇
+# ============================================================================
+def cluster(points, colors=None, eps=0.015, min_points=20,
+            max_z_spread=0.020):
+    """DBSCAN 欧式聚类 -> 多个物体簇。
+    eps: 邻域半径 (米), 同一簇内点间距 < eps。
+    min_points: 核心点邻域最少点数, 过滤小噪声簇。
+    max_z_spread: 丢弃 z 跨度过大的簇 (螺母上表面 ~5mm 薄层, 过大的簇是噪声/桌沿混入)。
+    返回 list of (points, colors), 每个是一个独立簇, 按点数降序。"""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) == 0:
+        return []
+    cols = np.asarray(colors) if colors is not None and len(colors) == len(pts) else None
+    labels = np.array(pcd_dbscan_labels(pts, eps, min_points))
+    clusters = []
+    for label in sorted(set(labels) - {-1}):   # -1 = 噪声, 丢弃
+        mask = labels == label
+        c_pts = pts[mask]
+        if len(c_pts) < min_points:
+            continue
+        z_spread = c_pts[:, 2].max() - c_pts[:, 2].min()
+        if z_spread > max_z_spread:   # z 跨度过大, 不是扁平螺母上表面
+            continue
+        c_cols = cols[mask] if cols is not None else None
+        clusters.append((c_pts, c_cols))
+    clusters.sort(key=lambda c: len(c[0]), reverse=True)   # 点数降序
+    print(f"  聚类: eps={eps*1000:.0f}mm min_points={min_points} -> {len(clusters)} 簇 "
+          f"(各簇点数: {[len(c[0]) for c in clusters]})")
+    return clusters
+
+
+def pcd_dbscan_labels(points, eps, min_points):
+    """封装 open3d DBSCAN, 返回 labels 数组 (-1=噪声)。"""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    labels = pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False)
+    return list(labels)
+
+
+# ============================================================================
+# 6. ICP 模板匹配
 # ============================================================================
 @dataclass
 class MatchResult:

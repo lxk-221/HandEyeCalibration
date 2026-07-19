@@ -176,16 +176,48 @@ class GraspTemplateBased(Grasp):
 
         if len(pts) < 50:
             raise RuntimeError(f"分割后点太少 ({len(pts)})")
-        match = pc.icp_match(pts, template,
-                             max_correspondence_distance=0.012, icp_iteration=80)
-        center = match.aligned_points.mean(axis=0)
-        print(f"  物体中心 (base) {np.round(center,4).tolist()}")
-        pc.show_match(pts, cols, match.aligned_points, center=center)
+
+        # 聚类: 把多个物体分成独立簇 (解决多物体场景 ICP 匹配歧义)
+        clusters = pc.cluster(pts, cols, eps=0.015, min_points=20, max_z_spread=0.020)
+        if not clusters:
+            raise RuntimeError("聚类未得到任何簇 (调 eps/min_points 或前面的过滤参数)")
+        # 可视化: 每簇一种颜色 (随机色), 看聚类是否分对了
+        rng = np.random.default_rng(42)
+        all_pts, all_cols = [], []
+        for c_pts, c_cols in clusters:
+            color = (rng.random(3) * 255).astype(np.uint8)
+            all_pts.append(c_pts)
+            all_cols.append(np.tile(color, (len(c_pts), 1)))
+        pc.show_pointcloud(np.vstack(all_pts), np.vstack(all_cols),
+                           title="[5] 聚类后 (每簇一色)")
+
+        # 逐簇 ICP 匹配该模板, 取 fitness 最高 (rmse 次之) 的簇作为目标物体。
+        # size 天然区分: 大模板匹配大簇 fitness 高, 匹配中小簇 fitness 低。
+        best_match, best_pts, best_cols, best_center, best_score = None, None, None, None, -1
+        for ci, (c_pts, c_cols) in enumerate(clusters):
+            print(f"  --- 簇 {ci+1}/{len(clusters)} ({len(c_pts)} 点) 匹配 ---")
+            try:
+                m = pc.icp_match(c_pts, template,
+                                 max_correspondence_distance=0.012, icp_iteration=80)
+            except Exception as e:
+                print(f"    跳过: {e}")
+                continue
+            score = m.info.get("fitness", 0)
+            center = m.aligned_points.mean(axis=0)
+            print(f"    score(fitness)={score:.4f} center={np.round(center,4).tolist()}")
+            if score > best_score:
+                best_match, best_pts, best_cols, best_center, best_score = \
+                    m, c_pts, c_cols, center, score
+        if best_match is None:
+            raise RuntimeError("所有簇都匹配失败")
+        print(f"  最优簇: fitness={best_score:.4f}, 物体中心 {np.round(best_center,4).tolist()}")
+        pc.show_match(best_pts, best_cols, best_match.aligned_points, center=best_center,
+                      title="[6] ICP match (最优簇)")
 
         # grasp_pose = 物体中心 + 写死偏置, 姿态写死 (复刻原程序 control_xyz/control_rpy)
         grasp_pose = np.eye(4, dtype=np.float64)
         grasp_pose[:3, :3] = Rot.from_euler("xyz", self.GRASP_RPY_RAD).as_matrix()
-        grasp_pose[:3, 3] = center + self.GRASP_OFFSET_M
+        grasp_pose[:3, 3] = best_center + self.GRASP_OFFSET_M
         print(f"  grasp_pose xyz={np.round(grasp_pose[:3,3],4).tolist()} "
               f"rpy_deg={np.round(np.degrees(self.GRASP_RPY_RAD),1).tolist()}")
         return grasp_pose
