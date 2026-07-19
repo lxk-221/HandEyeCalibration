@@ -138,10 +138,17 @@ class GraspTemplateBased(Grasp):
         pc.show_pointcloud(pts, cols, title="[2] voxel 下采样后")
         return pts, cols
 
-    # grasp 偏置与姿态 (写死, 复刻 xyz_bak camera_graspnet_rpc_client.py 的 control_xyz/rpy)。
-    # 数值与原程序完全一致, 便于验证 ICP 与原 GraspNet 工件匹配结果等价。
+    # 各动作高度参数 (复刻 xyz_bak client execute_control_pose 的数值, 保证一致):
+    #   grasp_pose = center + GRASP_OFFSET, rpy=GRASP_RPY (即原 control_xyz/control_rpy)
+    #   approach 先到 grasp_pose 上方 DESCEND_M, 再下降 DESCEND_M 抓取 (原程序 step2->step3)
+    #   place: 抬起 RAISE_M -> 放置位上方 -> 下降 PLACE_DESCEND_M -> 松手 -> 抬回
     GRASP_OFFSET_M = np.array([-0.07, 0.022, 0.23], dtype=np.float64)
     GRASP_RPY_RAD = np.array([-55.0, 0.0, 90.0]) * np.pi / 180.0
+    DESCEND_M = 0.13           # approach: 先到 grasp_pose 上方 0.13, 再下降 0.13 (原程序 step2->3)
+    RAISE_M = 0.15             # 抓后抬起 (原程序 step5)
+    PLACE_DESCEND_M = 0.14     # 放置: 从上方下降 (原程序 step7)
+    PLACE_RPY_RAD = np.array([-60.0, 0.0, 145.0]) * np.pi / 180.0
+    PLACE_XYZ = np.array([0.262, -0.09, 0.0], dtype=np.float64)   # 放置 xy (z 动态取抬起高度)
 
     def get_grasp_pose(self, pointcloud, template, T_ee2object=None):
         """模板 ICP 匹配物体 -> 直接按写死的 offset/rpy 算 grasp pose (复刻原程序)。
@@ -179,34 +186,68 @@ class GraspTemplateBased(Grasp):
         return grasp_pose
 
     def approach(self, grasp_pose):
-        """接近抓取位: 张手 -> 移到 grasp_pose 上方 (APPROACH_PRE_Z_M)。"""
-        above = np.asarray(grasp_pose, dtype=np.float64).copy()
-        above[2, 3] += self.APPROACH_PRE_Z_M
-        print(f"=== approach (上方 {self.APPROACH_PRE_Z_M*1000:.0f}mm) ===")
+        """接近抓取位 (复刻原程序 step1 张手 + step2 到 grasp_pose):
+          step1: 张手 READY
+          step2: 移到 grasp_pose (即原 control_xyz, 已是抬高的待下降位)。"""
+        print("=== approach ===")
+        print(f"  step1 hand READY {self.HAND_READY}")
         self.hand.move_hand(self.HAND_READY, timeout=self.HAND_TIMEOUT)
-        self.arm.move_arm(above, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
+        print(f"  step2 move to grasp_pose xyz={np.round(grasp_pose[:3,3],4).tolist()} "
+              f"rpy_deg={np.round(np.degrees(self.GRASP_RPY_RAD),1).tolist()}")
+        self.arm.move_arm(grasp_pose, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
                           timeout=self.ARM_TIMEOUT)
 
     def grasp(self, grasp_pose):
-        """抓取: 下降到 grasp_pose -> 抓手。"""
-        print("=== grasp (下降+抓) ===")
-        self.arm.move_arm(grasp_pose, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
+        """抓取 (复刻原程序 step3 下降 + step4 抓):
+          step3: 从 grasp_pose 下降 DESCEND_M 到真正抓取点
+          step4: 抓手 GRASP。"""
+        grasp_down = np.asarray(grasp_pose, dtype=np.float64).copy()
+        grasp_down[2, 3] -= self.DESCEND_M
+        self._last_grasp_down_T = grasp_down   # 记录给 place() 用
+        print("=== grasp ===")
+        print(f"  step3 descend {self.DESCEND_M*1000:.0f}mm to xyz={np.round(grasp_down[:3,3],4).tolist()}")
+        self.arm.move_arm(grasp_down, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
                           timeout=self.ARM_TIMEOUT)
+        print(f"  step4 hand GRASP {self.HAND_GRASP}")
         self.hand.move_hand(self.HAND_GRASP, timeout=self.HAND_TIMEOUT)
 
-    def place(self, place_pose):
-        """放置: 抬起 -> 移到 place_pose 上方 -> 下降 -> 松手 -> 抬回上方。
-        place_pose: 放置点 4x4 (base 系); 内部自动加抬起/下降高度。"""
-        above = np.asarray(place_pose, dtype=np.float64).copy()
-        above[2, 3] += self.PLACE_DESCEND_M   # 上方 = 放置点 + 下降量
-        print("=== place (抬->放置位->松手->抬回) ===")
-        # 抬起 (保持当前位姿只升 z) - 用 place 上方作为安全高度
-        self.arm.move_arm(above, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
+    def place(self):
+        """放置 (复刻原程序 step5~9, 放置位写死 PLACE_XYZ/PLACE_RPY):
+          step5: 从抓取位抬起 RAISE_M
+          step6: 移到放置位上方 (固定 xy + 抬起 z, PLACE_RPY)
+          step7: 下降 PLACE_DESCEND_M 到放置点
+          step8: 松手 RELEASE
+          step9: 抬回放置位上方。"""
+        if not hasattr(self, "_last_grasp_down_T"):
+            raise RuntimeError("place 需先调 grasp() 记录抓取位")
+        grasp_down = self._last_grasp_down_T
+        print("=== place ===")
+        # step5 抬起 (从抓取位 + RAISE_M, 保持抓取 xy/rpy)
+        raise_T = grasp_down.copy()
+        raise_T[2, 3] += self.RAISE_M
+        print(f"  step5 raise {self.RAISE_M*1000:.0f}mm to z={raise_T[2,3]:.4f}")
+        self.arm.move_arm(raise_T, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
                           timeout=self.ARM_TIMEOUT)
-        self.arm.move_arm(place_pose, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
+        # step6 移到放置位上方 (固定 xy, z=抬起高度, 固定放置 rpy)
+        place_above_T = np.eye(4, dtype=np.float64)
+        place_above_T[:3, :3] = Rot.from_euler("xyz", self.PLACE_RPY_RAD).as_matrix()
+        place_above_T[:3, 3] = [self.PLACE_XYZ[0], self.PLACE_XYZ[1], raise_T[2, 3]]
+        print(f"  step6 place_above xyz={np.round(place_above_T[:3,3],4).tolist()} "
+              f"rpy_deg={np.round(np.degrees(self.PLACE_RPY_RAD),1).tolist()}")
+        self.arm.move_arm(place_above_T, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
                           timeout=self.ARM_TIMEOUT)
+        # step7 下降到放置点
+        place_T = place_above_T.copy()
+        place_T[2, 3] -= self.PLACE_DESCEND_M
+        print(f"  step7 place descend {self.PLACE_DESCEND_M*1000:.0f}mm to z={place_T[2,3]:.4f}")
+        self.arm.move_arm(place_T, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
+                          timeout=self.ARM_TIMEOUT)
+        # step8 松手
+        print(f"  step8 hand RELEASE {self.HAND_RELEASE}")
         self.hand.move_hand(self.HAND_RELEASE, timeout=self.HAND_TIMEOUT)
-        self.arm.move_arm(above, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
+        # step9 抬回放置位上方
+        print(f"  step9 raise back to place_above")
+        self.arm.move_arm(place_above_T, speed=self.ARM_SPEED, accel=self.ARM_ACCEL,
                           timeout=self.ARM_TIMEOUT)
 
 
@@ -257,11 +298,7 @@ if __name__ == "__main__":
                                           _ee2object(thickness))
             g.approach(grasp_pose)
             g.grasp(grasp_pose)
-            # place_pose: 放置位 (base 系)
-            place_pose = np.eye(4)
-            place_pose[:3, :3] = Rot.from_euler("xyz", [-60, 0, 145], degrees=True).as_matrix()
-            place_pose[:3, 3] = [0.262, -0.09, -0.22]
-            g.place(place_pose)
+            g.place()
         # cool down
         g.cool_down()
         cam.release()

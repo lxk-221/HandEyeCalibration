@@ -66,18 +66,6 @@ NUT_THICKNESS_M = {
 }
 
 
-# ---- 放置位 (base 系) ----
-PLACE_RPY_DEG = np.array([-60.0, 0.0, 145.0])
-PLACE_XYZ = np.array([0.262, -0.09, -0.22], dtype=np.float64)
-
-
-def make_place_pose():
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = Rot.from_euler("xyz", PLACE_RPY_DEG, degrees=True).as_matrix()
-    T[:3, 3] = PLACE_XYZ
-    return T
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description="模板匹配抓取 (GraspTemplateBased)")
     ap.add_argument("--lcm-url", default="udpm://239.255.76.67:7667?ttl=0",
@@ -112,7 +100,7 @@ def main(argv=None):
                     continue
                 g.approach(grasp_pose)
                 g.grasp(grasp_pose)
-                g.place(make_place_pose())
+                g.place()
 
             g.cool_down()
             print("=== 全部完成 ===")
