@@ -138,14 +138,18 @@ class GraspTemplateBased(Grasp):
         pc.show_pointcloud(pts, cols, title="[2] voxel 下采样后")
         return pts, cols
 
-    def get_grasp_pose(self, pointcloud, template, T_ee2object):
-        """模板 ICP 匹配物体 -> 应用 T_ee2object 得到 grasp pose (base 系, 4x4)。
+    # grasp 偏置与姿态 (写死, 复刻 xyz_bak camera_graspnet_rpc_client.py 的 control_xyz/rpy)。
+    # 数值与原程序完全一致, 便于验证 ICP 与原 GraspNet 工件匹配结果等价。
+    GRASP_OFFSET_M = np.array([-0.07, 0.022, 0.23], dtype=np.float64)
+    GRASP_RPY_RAD = np.array([-55.0, 0.0, 90.0]) * np.pi / 180.0
+
+    def get_grasp_pose(self, pointcloud, template, T_ee2object=None):
+        """模板 ICP 匹配物体 -> 直接按写死的 offset/rpy 算 grasp pose (复刻原程序)。
 
         pointcloud: scan() 返回的 (points, colors) 或仅 points (base 系)
         template:   工件模板 .ply 路径
-        T_ee2object: 末端相对【匹配出的物体中心】的位姿 (4x4)。
-                    厚度修正(z - thickness/2)、ee 偏置/姿态 全部内化在此, 调用者构造。
-        返回: grasp_pose 4x4 (base 系)。物体中心位姿 = ICP 平移 (姿态取单位, 因模板是平面)。
+        T_ee2object: 暂保留参数 (未使用)。后续若要统一偏置语义再启用。
+        返回: grasp_pose 4x4 (base 系)。xyz = 物体中心 + GRASP_OFFSET_M, rpy = GRASP_RPY_RAD。
         """
         pts = pointcloud[0] if isinstance(pointcloud, tuple) else pointcloud
         cols = pointcloud[1] if isinstance(pointcloud, tuple) else None
@@ -166,11 +170,13 @@ class GraspTemplateBased(Grasp):
         print(f"  物体中心 (base) {np.round(center,4).tolist()}")
         pc.show_match(pts, cols, match.aligned_points, center=center)
 
-        # 物体中心位姿 (平移=中心, 姿态=单位, 因模板是 z=0 平面无姿态信息)
-        T_object2base = np.eye(4, dtype=np.float64)
-        T_object2base[:3, 3] = center
-        # grasp_pose = 物体位姿 @ ee2object
-        return T_object2base @ np.asarray(T_ee2object, dtype=np.float64).reshape(4, 4)
+        # grasp_pose = 物体中心 + 写死偏置, 姿态写死 (复刻原程序 control_xyz/control_rpy)
+        grasp_pose = np.eye(4, dtype=np.float64)
+        grasp_pose[:3, :3] = Rot.from_euler("xyz", self.GRASP_RPY_RAD).as_matrix()
+        grasp_pose[:3, 3] = center + self.GRASP_OFFSET_M
+        print(f"  grasp_pose xyz={np.round(grasp_pose[:3,3],4).tolist()} "
+              f"rpy_deg={np.round(np.degrees(self.GRASP_RPY_RAD),1).tolist()}")
+        return grasp_pose
 
     def approach(self, grasp_pose):
         """接近抓取位: 张手 -> 移到 grasp_pose 上方 (APPROACH_PRE_Z_M)。"""
