@@ -147,21 +147,28 @@ class GraspTemplateBased(Grasp):
     #   grasp_pose = center + GRASP_OFFSET, rpy=GRASP_RPY (即原 control_xyz/control_rpy)
     #   approach 先到 grasp_pose 上方 DESCEND_M, 再下降 DESCEND_M 抓取 (原程序 step2->step3)
     #   place: 抬起 RAISE_M -> 放置位上方 -> 下降 PLACE_DESCEND_M -> 松手 -> 抬回
-    GRASP_OFFSET_M = np.array([-0.07, 0.022, 0.23], dtype=np.float64)
+    # 原程序 GRASP_OFFSET_M[2]=0.23 是以大零件(厚0.035)为基准 (含 0.035/2 下沉到厚度中心)。
+    # 改为不含厚度的基础值 (0.23+0.035/2), get_grasp_pose 按实际 thickness 动态减 thickness/2。
+    BASE_THICKNESS_M = 0.035   # 原基准厚度 (大零件), GRASP_OFFSET_M[2] 以此为基准
+    GRASP_OFFSET_M = np.array([-0.07, 0.022, 0.23 + BASE_THICKNESS_M / 2], dtype=np.float64)
     GRASP_RPY_RAD = np.array([-55.0, 0.0, 90.0]) * np.pi / 180.0
     DESCEND_M = 0.13           # approach: 先到 grasp_pose 上方 0.13, 再下降 0.13 (原程序 step2->3)
-    RAISE_M = 0.15             # 抓后抬起 (原程序 step5)
-    PLACE_DESCEND_M = 0.14     # 放置: 从上方下降 (原程序 step7)
+    RAISE_M = 0.25             # 抓后抬起 (原程序 step5)
+    PLACE_DESCEND_M = 0.05     # 放置: 从上方下降 (原程序 step7)
     PLACE_RPY_RAD = np.array([-60.0, 0.0, 145.0]) * np.pi / 180.0
-    PLACE_XYZ = np.array([0.262, -0.09, 0.0], dtype=np.float64)   # 放置 xy (z 动态取抬起高度)
+    #PLACE_XYZ = np.array([0.262, -0.09, 0.0], dtype=np.float64)   # 放置 xy (z 动态取抬起高度)
+    PLACE_XYZ = np.array([0.345, -0.015, 0.0], dtype=np.float64)   # 放置 xy (z 动态取抬起高度)
 
-    def get_grasp_pose(self, pointcloud, template, T_ee2object=None):
-        """模板 ICP 匹配物体 -> 直接按写死的 offset/rpy 算 grasp pose (复刻原程序)。
+    def get_grasp_pose(self, pointcloud, template, thickness=0.005, T_ee2object=None):
+        """模板 ICP 匹配物体 -> 按写死 offset/rpy + 动态厚度算 grasp pose。
 
         pointcloud: scan() 返回的 (points, colors) 或仅 points (base 系)
         template:   工件模板 .ply 路径
-        T_ee2object: 暂保留参数 (未使用)。后续若要统一偏置语义再启用。
-        返回: grasp_pose 4x4 (base 系)。xyz = 物体中心 + GRASP_OFFSET_M, rpy = GRASP_RPY_RAD。
+        thickness:  工件真实厚度 (米)。GRASP_OFFSET_M 以大零件(BASE_THICKNESS)为基准,
+                    不同厚度动态调整 z: 实际 offset_z = GRASP_OFFSET_M[2] - thickness/2
+                    (抓取下沉到该工件的厚度中心)。
+        T_ee2object: 暂保留参数 (未使用)。
+        返回: grasp_pose 4x4 (base 系)。
         """
         pts = pointcloud[0] if isinstance(pointcloud, tuple) else pointcloud
         cols = pointcloud[1] if isinstance(pointcloud, tuple) else None
@@ -215,10 +222,13 @@ class GraspTemplateBased(Grasp):
         pc.show_match(pts, cols, best_match.aligned_points, center=best_center,
                       title="[6] ICP match (红=模板 全场景背景 黄球=匹配中心)")
 
-        # grasp_pose = 物体中心 + 写死偏置, 姿态写死 (复刻原程序 control_xyz/control_rpy)
+        # grasp_pose = 物体中心 + 偏置, 姿态写死。z 按工件厚度动态调整 (下沉到厚度中心):
+        # GRASP_OFFSET_M[2] 以大零件(BASE_THICKNESS)为基准, 薄零件少下沉 thickness/2。
+        offset = self.GRASP_OFFSET_M.copy()
+        offset[2] -= thickness / 2   # 越薄的零件, 下沉越少 (停在它的厚度中心)
         grasp_pose = np.eye(4, dtype=np.float64)
         grasp_pose[:3, :3] = Rot.from_euler("xyz", self.GRASP_RPY_RAD).as_matrix()
-        grasp_pose[:3, 3] = best_center + self.GRASP_OFFSET_M
+        grasp_pose[:3, 3] = best_center + offset
         print(f"  grasp_pose xyz={np.round(grasp_pose[:3,3],4).tolist()} "
               f"rpy_deg={np.round(np.degrees(self.GRASP_RPY_RAD),1).tolist()}")
         return grasp_pose

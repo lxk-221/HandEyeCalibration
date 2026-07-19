@@ -44,22 +44,6 @@ SCAN_POSES = [
     _pose([0.400, -0.250, -0.223], [0, 0, 90]),
 ]
 
-# ---- ee 相对物体中心的位姿 (含厚度修正 + ee 偏置/姿态), 全部内化在此 4x4 ----
-# 例: 上方斜抓, z = 0.23 + thickness/2 (抓厚度中心), rpy=(-55,0,90)
-EE_OFFSET = np.array([-0.07, 0.022], dtype=np.float64)
-EE_Z_BASE = 0.23
-EE_RPY_DEG = np.array([-55.0, 0.0, 90.0])
-
-
-def make_T_ee2object(thickness_m):
-    """根据工件厚度构造 T_ee2object (ee 相对物体中心的位姿)。
-    厚度内化: z 抬高 thickness/2 (抓厚度中心, 因 ICP 匹配的是上表面)。"""
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = Rot.from_euler("xyz", EE_RPY_DEG, degrees=True).as_matrix()
-    T[:3, 3] = [EE_OFFSET[0], EE_OFFSET[1], EE_Z_BASE + thickness_m / 2]
-    return T
-
-
 # ---- 工件配置 (遍历 TEMPLATES_DIR 的 .ply; 厚度按文件名查表) ----
 NUT_THICKNESS_M = {
     "hex_hole_40mm_45mm_35mm": 0.035,
@@ -101,7 +85,7 @@ def main(argv=None):
                 print(f"\n--- 工件 {tpl} (厚度 {thickness*1000:.0f}mm) ---")
                 pointcloud = g.scan(SCAN_POSES)          # 每次抓取前重新扫描
                 grasp_pose = g.get_grasp_pose(
-                    pointcloud, os.path.join(TEMPLATES_DIR, tpl), make_T_ee2object(thickness))
+                    pointcloud, os.path.join(TEMPLATES_DIR, tpl), thickness=thickness)
                 print(f"  grasp_pose xyz={np.round(grasp_pose[:3,3],4).tolist()}")
                 if not args.yes and input("确认抓取? [y/N]: ").strip().lower() not in ("y", "yes"):
                     print("  跳过")
