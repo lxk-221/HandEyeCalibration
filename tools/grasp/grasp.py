@@ -121,8 +121,10 @@ class GraspTemplateBased(Grasp):
             raise RuntimeError("扫描未取到任何点云")
         pts, cols = pc.merge_frames_to_base(frames, self.T_cam2gripper)
         print(f"  拼合 {len(pts)} 点")
+        pc.show_pointcloud(pts, cols, title="[1] 拼合后 (base系)")
         pts, cols = pc.voxel_downsample(pts, cols, self.VOXEL_SIZE_M)
         print(f"  下采样 {len(pts)} 点")
+        pc.show_pointcloud(pts, cols, title="[2] voxel 下采样后")
         return pts, cols
 
     def get_grasp_pose(self, pointcloud, template, T_ee2object):
@@ -136,14 +138,16 @@ class GraspTemplateBased(Grasp):
         """
         pts = pointcloud[0] if isinstance(pointcloud, tuple) else pointcloud
         cols = pointcloud[1] if isinstance(pointcloud, tuple) else None
-        pts_seg, _ = pc.segment_workpiece_from_base(pts, cols)
+        pts_seg, cols_seg = pc.segment_workpiece_from_base(pts, cols)
         if len(pts_seg) < 50:
             raise RuntimeError(f"分割后点太少 ({len(pts_seg)})")
+        pc.show_pointcloud(pts_seg, cols_seg, title="[3] 分割后 (去桌面)")
         match = pc.match_workpiece_point_cloud(
             pts_seg, template, max_correspondence_distance=0.012, icp_iteration=80)
         center = match.aligned_points.mean(axis=0)
         print(f"  ICP fitness={match.info.get('fitness',0):.4f} "
               f"rmse={match.info.get('rmse',0):.5f}, 物体中心 {np.round(center,4).tolist()}")
+        pc.show_match(pts_seg, cols_seg, match.aligned_points, center=center)
 
         # 物体中心位姿 (平移=中心, 姿态=单位, 因模板是 z=0 平面无姿态信息)
         T_object2base = np.eye(4, dtype=np.float64)
