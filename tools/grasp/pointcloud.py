@@ -69,10 +69,11 @@ def range_filter(points, colors=None,
 # ============================================================================
 def ransac_filter_plane(points, colors=None,
                         distance_thresh=0.004, ransac_n=3, ransac_iter=1000,
-                        min_inlier_ratio=0.05, remove_below=True):
+                        min_inlier_ratio=0.05, remove_below=True, max_above_m=0.04):
     """RANSAC 拟合一个平面 (通常是桌面), 去掉平面内点;
-    remove_below=True 时还去掉平面【下方】的点 (保留桌面之上的物体)。
-    base 系下桌面是大平面, 物体在桌面之上 -> 默认 remove_below=True 保留物体。
+    remove_below=True 时还去掉平面【下方】的点;
+    max_above_m>0 时还去掉平面之上【过高】的点 (只保留紧贴桌面的物体, 如螺母上表面)。
+    -> 最终保留平面以上、max_above_m 以内的点 (桌面上的薄物体)。
     inlier_ratio < min_inlier_ratio 时认为没找到有效平面, 不过滤 (原样返回)。
     返回 (points_keep, colors_keep, plane_model)。plane_model=[a,b,c,d], ax+by+cz+d=0。"""
     pts = np.asarray(points, dtype=np.float64)
@@ -89,13 +90,19 @@ def ransac_filter_plane(points, colors=None,
     plane_inlier_mask = np.zeros(len(pts), dtype=bool)
     plane_inlier_mask[inliers] = True
     a, b, c, d = [float(v) for v in plane_model]
-    if remove_below and abs(c) > 1e-9:
+    if abs(c) > 1e-9:
         z_plane = -(a * pts[:, 0] + b * pts[:, 1] + d) / c
-        below_mask = pts[:, 2] <= z_plane   # 平面及下方
+        height = pts[:, 2] - z_plane   # 各点相对平面的高度 (>0 在上方)
     else:
-        below_mask = np.zeros(len(pts), dtype=bool)
-    keep = ~(plane_inlier_mask | below_mask)
+        height = np.zeros(len(pts))
+    # below: 平面及下方; above_max: 平面之上过高 (超出 max_above_m)
+    below_mask = (height <= 0) if remove_below else np.zeros(len(pts), dtype=bool)
+    above_max_mask = (height > max_above_m) if max_above_m and max_above_m > 0 else np.zeros(len(pts), dtype=bool)
+    keep = ~(plane_inlier_mask | below_mask | above_max_mask)
     out_cols = np.asarray(colors)[keep] if colors is not None and len(colors) == len(pts) else None
+    print(f"  RANSAC 平面过滤: 去桌面 {plane_inlier_mask.sum()} 点, "
+          f"去下方 {below_mask.sum()} 点, 去>={max_above_m*1000:.0f}cm 高 {above_max_mask.sum()} 点, "
+          f"保留 {keep.sum()}/{len(pts)}")
     return pts[keep], out_cols, plane_model
 
 
