@@ -95,7 +95,7 @@ def main(argv=None):
     try:
         with LcmCommander(lcm_url=args.lcm_url) as cmd:
             g = GraspTemplateBased(arm=cmd, hand=cmd, T_CAM2GRIPPER=T_CAM2GRIPPER, camera=cam)
-            g.warm_up()
+            #g.warm_up()
             pointcloud = g.scan(SCAN_POSES)
 
             # 遍历模板 (假设每个模板在场景中都能匹配到一个工件)

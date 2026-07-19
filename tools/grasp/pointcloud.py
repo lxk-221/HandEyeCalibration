@@ -171,6 +171,9 @@ def icp_match(scene_points, template_path,
     }
     print(f"  ICP: {len(pts)} 场景点 <- {len(aligned_points)} 模板点, "
           f"fitness={info['fitness']:.4f} rmse={info['rmse']:.5f}")
+    # 诊断: 配准后模板 + 场景的 bbox, 看是否重合 (不重合 = ICP 失败, 模板飞走)
+    print(f"    场景 bbox: [{np.round(pts.min(0),3).tolist()} ~ {np.round(pts.max(0),3).tolist()}]")
+    print(f"    模板 bbox: [{np.round(aligned_points.min(0),3).tolist()} ~ {np.round(aligned_points.max(0),3).tolist()}]")
     return MatchResult(aligned_points, aligned_colors,
                        np.asarray(result.transformation, dtype=np.float64), info)
 
