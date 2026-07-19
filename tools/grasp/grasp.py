@@ -64,7 +64,7 @@ class GraspTemplateBased(Grasp):
     HAND_READY = [255, 10, 255, 255, 255, 255]
     HAND_GRASP = [0, 5, 70, 80, 80, 70]
     HAND_RELEASE = [255, 5, 255, 255, 255, 255]
-    HAND_INIT = [255, 255, 255, 255, 255, 255]
+    HAND_INIT = [255, 5, 255, 255, 255, 255]
     ARM_SPEED, ARM_ACCEL = 0.8, 0.8
     ARM_TIMEOUT, HAND_TIMEOUT = 60.0, 3.0
     # approach 预置高度 (相对 grasp_pose 上方), approach 时先到这里再下降
@@ -178,7 +178,7 @@ class GraspTemplateBased(Grasp):
             raise RuntimeError(f"分割后点太少 ({len(pts)})")
 
         # 聚类: 把多个物体分成独立簇 (解决多物体场景 ICP 匹配歧义)
-        clusters = pc.cluster(pts, cols, eps=0.015, min_points=20, max_z_spread=0.020)
+        clusters = pc.cluster(pts, cols)   # 默认 eps=20mm min_points=10 max_z_spread=30mm
         if not clusters:
             raise RuntimeError("聚类未得到任何簇 (调 eps/min_points 或前面的过滤参数)")
         # 可视化: 每簇一种颜色 (随机色), 看聚类是否分对了
@@ -211,8 +211,9 @@ class GraspTemplateBased(Grasp):
         if best_match is None:
             raise RuntimeError("所有簇都匹配失败")
         print(f"  最优簇: fitness={best_score:.4f}, 物体中心 {np.round(best_center,4).tolist()}")
-        pc.show_match(best_pts, best_cols, best_match.aligned_points, center=best_center,
-                      title="[6] ICP match (最优簇)")
+        # 在【全部原点云】上显示匹配结果 (看清模板对的是哪个螺母, 其他螺母在哪)
+        pc.show_match(pts, cols, best_match.aligned_points, center=best_center,
+                      title="[6] ICP match (红=模板 全场景背景 黄球=匹配中心)")
 
         # grasp_pose = 物体中心 + 写死偏置, 姿态写死 (复刻原程序 control_xyz/control_rpy)
         grasp_pose = np.eye(4, dtype=np.float64)
