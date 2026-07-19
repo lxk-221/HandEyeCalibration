@@ -1,178 +1,155 @@
 """
-点云处理 + 模板匹配 (ICP) 核心模块。
+点云处理核心模块 (5 个单一职责函数 + 坐标变换 + 可视化)。
 
-从 indust_grasp/graspnet-baseline/demo.py 提取, 剥离所有 graspnet 推理依赖,
-全部改成显式函数参数 (去掉 demo.py 的 cfgs 全局对象)。
+坐标系: base 系 (米)。scan 后的点云已转到 base 系, 后续处理都在 base 系。
+依赖: open3d + numpy。无 graspnet / 无 cv2 (除可视化外不需要)。
 
-依赖: 仅 open3d + cv2 + numpy。
+5 个核心职责 (每个是原子函数, 便于在调用方分步可视化):
+  1. merge(frames, T_cam2gripper) -> base 系拼合点云
+  2. range_filter(points, x/y/z min/max) -> 范围过滤 (缺省 inf = 不过滤)
+  3. ransac_filter_plane(points, ...) -> RANSAC 去平面 (可选去/留平面之上的点)
+  4. voxel_downsample(points, voxel_size) -> 体素降采样
+  5. icp_match(scene, template) -> ICP 模板配准
 
-坐标系约定: 所有点云都在**相机坐标系**下 (z 朝远、x 向右、y 向下, OpenCV/RGBD 约定),
-单位米。T_gripper2base 用于把相机系结果变到 base 系 (在 template_based_grasp 里做)。
-
-主要流程 (process_scene):
-    RGB-D/点云
-      -> (可选) 去畸变 + 深度平滑
-      -> 距离过滤        distance_filter_point_cloud
-      -> RANSAC 平面分割  ransac_remove_plane_and_greater_z  (去掉桌面及桌面上方)
-      -> ICP 模板匹配     match_workpiece_point_cloud        (完整模板对齐到场景物体)
-      -> 输出: 模板点云(base系) + 工件中心(base系) + 配准信息
+可视化: show_pointcloud / show_match (shift+左键拾取点坐标)。
 """
 import os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-import cv2
 import numpy as np
 import open3d as o3d
 
 
-# ---------------- 相机模型 (内联自 data_utils, 仅 numpy) ----------------
-@dataclass
-class CameraInfo:
-    width: int
-    height: int
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-    scale: float = 1.0
+# ============================================================================
+# 1. 多帧拼合 (相机系 -> base 系)
+# ============================================================================
+def merge(frames, T_cam2gripper):
+    """把多帧 (相机系点云 + 拍照时刻 T_gripper2base) 全部转到 base 系并拼接。
+    frames: list of (points_camera Nx3 米, colors Nx3 uint8, T_gripper2base 4x4)。
+    T_cam2gripper: 手眼标定 4x4 (平移米)。T_camera2base = T_gripper2base @ T_cam2gripper。
+    返回 (points_base Nx3 float64, colors Nx3 uint8)。"""
+    T_c2g = np.asarray(T_cam2gripper, dtype=np.float64).reshape(4, 4)
+    all_pts, all_cols = [], []
+    for points_cam, colors, T_g2b in frames:
+        T_c2b = np.asarray(T_g2b, dtype=np.float64).reshape(4, 4) @ T_c2g
+        p = np.asarray(points_cam, dtype=np.float64)
+        pts_base = (T_c2b[:3, :3] @ p.T + T_c2b[:3, 3:4]).T
+        all_pts.append(pts_base)
+        all_cols.append(np.asarray(colors, dtype=np.uint8))
+    if not all_pts:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.uint8)
+    return np.concatenate(all_pts, 0), np.concatenate(all_cols, 0)
 
 
-def create_point_cloud_from_depth_image(depth, camera, organized=True):
-    """depth (H,W) + CameraInfo -> 点云。organized=True 保留 (H,W,3), 否则展平 (N,3)。
-    复刻自 data_utils.create_point_cloud_from_depth_image。"""
-    fx, fy, cx, cy = camera.fx, camera.fy, camera.cx, camera.cy
-    z = depth.astype(np.float32) * camera.scale
-    x_axis = np.arange(camera.width, dtype=np.float32)   # 沿 W
-    y_axis = np.arange(camera.height, dtype=np.float32)  # 沿 H
-    x = (x_axis[None, :] - cx) * z / fx   # (H,W) 广播
-    y = (y_axis[:, None] - cy) * z / fy
-    cloud = np.stack([x, y, z], axis=-1)  # (H,W,3)
-    return cloud if organized else cloud.reshape(-1, 3)
+# ============================================================================
+# 2. 范围过滤 (6 轴 min/max, None = 不限)
+# ============================================================================
+def range_filter(points, colors=None,
+                 x_min=None, x_max=None,
+                 y_min=None, y_max=None,
+                 z_min=None, z_max=None):
+    """保留 [x_min,x_max]×[y_min,y_max]×[z_min,z_max] 内的点 (None = 该轴不过滤)。
+    返回 (points_keep, colors_keep)。"""
+    pts = np.asarray(points, dtype=np.float64)
+    keep = np.ones(len(pts), dtype=bool)
+    for ax, lo, hi in [(0, x_min, x_max), (1, y_min, y_max), (2, z_min, z_max)]:
+        if lo is not None:
+            keep &= pts[:, ax] >= lo
+        if hi is not None:
+            keep &= pts[:, ax] <= hi
+    out_pts = pts[keep]
+    out_cols = np.asarray(colors)[keep] if colors is not None and len(colors) == len(pts) else None
+    return out_pts, out_cols
 
 
-# ---------------- 深度预处理 ----------------
-def _odd_kernel(value):
-    value = int(value)
-    if value <= 0:
-        return 0
-    return value if value % 2 == 1 else value + 1
-
-
-def smooth_depth(depth_uint16, factor_depth,
-                 median_kernel=0, bilateral_d=0,
-                 bilateral_sigma_color=0.0, bilateral_sigma_space=0.0):
-    """深度平滑: 中值滤波 + 双边滤波 (只在有效像素上)。复刻自 demo.smooth_depth。
-    depth_uint16: (H,W) uint16 mm; factor_depth: mm->m 的除数 (1000)。"""
-    depth = depth_uint16.astype(np.uint16, copy=True)
-    median_kernel = _odd_kernel(median_kernel)
-    if median_kernel > 1:
-        depth = cv2.medianBlur(depth, median_kernel)
-    if bilateral_d > 0:
-        valid = depth > 0
-        depth_m = depth.astype(np.float32) / factor_depth
-        filtered = cv2.bilateralFilter(depth_m, d=bilateral_d,
-                                       sigmaColor=bilateral_sigma_color,
-                                       sigmaSpace=bilateral_sigma_space)
-        depth_m[valid] = filtered[valid]
-        depth_m[~valid] = 0.0
-        depth = np.clip(depth_m * factor_depth, 0, np.iinfo(np.uint16).max).astype(np.uint16)
-    return depth
-
-
-def undistort_rgbd(color, depth, workspace_mask, intrinsic_matrix, dist_coeffs):
-    """RGB-D 去畸变 (用 initUndistortRectifyMap + remap)。
-    复刻自 demo.undistort_rgbd, 但把写死的 CALI_DIST 改成显式 dist_coeffs 参数。
-    workspace_mask: bool 数组; 返回 (color, depth_uint16, mask_bool)。"""
-    h, w = depth.shape
-    if color.shape[:2] != (h, w):
-        color = cv2.resize(color, (w, h), interpolation=cv2.INTER_LINEAR)
-    intrinsic_matrix = np.asarray(intrinsic_matrix, dtype=np.float32).reshape(3, 3)
-    map_x, map_y = cv2.initUndistortRectifyMap(
-        intrinsic_matrix, np.asarray(dist_coeffs, dtype=np.float32),
-        None, intrinsic_matrix, (w, h), cv2.CV_32FC1)
-    color = cv2.remap(color, map_x, map_y, interpolation=cv2.INTER_LINEAR,
-                      borderMode=cv2.BORDER_CONSTANT)
-    depth = cv2.remap(depth, map_x, map_y, interpolation=cv2.INTER_NEAREST,
-                      borderMode=cv2.BORDER_CONSTANT)
-    workspace_mask = cv2.remap(
-        (np.asarray(workspace_mask) > 0).astype(np.uint8) * 255, map_x, map_y,
-        interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT) > 0
-    return color, depth.astype(np.uint16), workspace_mask
-
-
-# ---------------- 点云过滤 / 分割 ----------------
-def distance_filter_point_cloud(points, min_distance_m, max_distance_m, mode='z'):
-    """保留 [min, max] 距离内的点。mode='z' 用相机 z; 'radius' 用欧氏距离。
-    返回 bool mask (len(points),)。"""
-    if mode == 'radius':
-        distance = np.linalg.norm(points, axis=1)
-    else:
-        distance = points[:, 2]
-    return (distance >= min_distance_m) & (distance <= max_distance_m)
-
-
-def ransac_remove_plane_and_greater_z(points, colors, distance_thresh,
-                                      ransac_n=3, ransac_iter=1000,
-                                      min_inlier_ratio=0.0):
-    """RANSAC 拟合平面, 去掉平面内点 + z 大于平面的点 (即桌面及桌面上方)。
-    返回 (points_kept, colors_kept, keep_mask, plane_model, plane_inlier_mask, greater_plane_mask)。
-    inlier_ratio < min_inlier_ratio 时跳过删除 (认为没找到有效平面)。"""
-    if len(points) < ransac_n:
-        empty = np.zeros(len(points), dtype=bool)
-        return points, colors, np.ones(len(points), dtype=bool), None, empty, empty
-
+# ============================================================================
+# 3. RANSAC 平面分割 (可选去平面 + 平面之上的点)
+# ============================================================================
+def ransac_filter_plane(points, colors=None,
+                        distance_thresh=0.004, ransac_n=3, ransac_iter=1000,
+                        min_inlier_ratio=0.05, remove_above=True):
+    """RANSAC 拟合一个平面, 去掉平面内点 (remove_above=True 时还去平面之上的点)。
+    典型用途: 去桌面 (桌面是最大平面, 物体在桌面之上)。
+    inlier_ratio < min_inlier_ratio 时认为没找到有效平面, 不过滤 (原样返回)。
+    返回 (points_keep, colors_keep, plane_model)。plane_model=[a,b,c,d], ax+by+cz+d=0。"""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < ransac_n:
+        return pts, (np.asarray(colors) if colors is not None else None), None
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    pcd.points = o3d.utility.Vector3dVector(pts)
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=distance_thresh, ransac_n=ransac_n, num_iterations=ransac_iter)
     inliers = np.asarray(inliers, dtype=np.int64)
-    inlier_ratio = len(inliers) / float(len(points))
-    if inlier_ratio < min_inlier_ratio:
-        empty = np.zeros(len(points), dtype=bool)
-        return points, colors, np.ones(len(points), dtype=bool), plane_model, empty, empty
+    if len(inliers) / float(len(pts)) < min_inlier_ratio:
+        return pts, (np.asarray(colors) if colors is not None else None), plane_model
 
-    plane_inlier_mask = np.zeros(len(points), dtype=bool)
+    plane_inlier_mask = np.zeros(len(pts), dtype=bool)
     plane_inlier_mask[inliers] = True
     a, b, c, d = [float(v) for v in plane_model]
-    if abs(c) < 1e-9:
-        greater_plane_mask = np.zeros(len(points), dtype=bool)
+    if remove_above and abs(c) > 1e-9:
+        z_plane = -(a * pts[:, 0] + b * pts[:, 1] + d) / c
+        above_mask = pts[:, 2] > z_plane
     else:
-        z_plane = -(a * points[:, 0] + b * points[:, 1] + d) / c
-        greater_plane_mask = points[:, 2] > z_plane
-
-    keep_mask = ~(plane_inlier_mask | greater_plane_mask)
-    return (points[keep_mask], colors[keep_mask], keep_mask,
-            plane_model, plane_inlier_mask, greater_plane_mask)
+        above_mask = np.zeros(len(pts), dtype=bool)
+    keep = ~(plane_inlier_mask | above_mask)
+    out_cols = np.asarray(colors)[keep] if colors is not None and len(colors) == len(pts) else None
+    return pts[keep], out_cols, plane_model
 
 
-# ---------------- ICP 模板匹配 ----------------
-def _centroid_initial_transform(source_points, target_points):
-    """初始变换: 用质心差做平移 (ICP 初值)。"""
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, 3] = target_points.mean(axis=0) - source_points.mean(axis=0)
-    return transform
+# ============================================================================
+# 4. 体素降采样
+# ============================================================================
+def voxel_downsample(points, colors=None, voxel_size=0.002):
+    """体素降采样 (open3d)。voxel_size 米。返回 (points_down, colors_down)。"""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) == 0 or voxel_size <= 0:
+        return pts, (np.asarray(colors) if colors is not None else None)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    if colors is not None and len(colors) == len(pts):
+        pcd.colors = o3d.utility.Vector3dVector(
+            np.clip(np.asarray(colors, dtype=np.float64) / 255.0, 0.0, 1.0))
+    pcd = pcd.voxel_down_sample(voxel_size)
+    out_pts = np.asarray(pcd.points, dtype=np.float64)
+    cols = np.asarray(pcd.colors, dtype=np.float64)
+    if len(cols) == len(out_pts):
+        out_cols = np.clip(cols * 255.0, 0, 255).astype(np.uint8)
+    else:
+        out_cols = np.tile(np.array([[180, 180, 173]], dtype=np.uint8), (len(out_pts), 1))
+    return out_pts, out_cols
 
 
-def match_workpiece_point_cloud(target_points, workpiece_cloud_path,
-                                max_correspondence_distance, icp_iteration):
-    """把完整模板点云 (source) ICP 配准到场景分割出的物体点 (target)。
-    target_points: (N,3) 相机系米; workpiece_cloud_path: .ply 模板。
-    返回 MatchResult (aligned_points 相机系米, transform 4x4 source->target, info dict)。"""
-    if len(target_points) == 0:
-        raise ValueError('No target object points for workpiece registration.')
-    if not os.path.exists(workpiece_cloud_path):
-        raise FileNotFoundError('Workpiece point cloud not found: %s' % workpiece_cloud_path)
+# ============================================================================
+# 5. ICP 模板匹配
+# ============================================================================
+@dataclass
+class MatchResult:
+    aligned_points: np.ndarray       # (N,3) 模板配准后 (与 scene 同坐标系), 米
+    aligned_colors: np.ndarray       # (N,3) float 0..1
+    transform: np.ndarray            # 4x4 source(template)->target(scene)
+    info: dict = field(default_factory=dict)
 
-    source = o3d.io.read_point_cloud(workpiece_cloud_path)
+
+def icp_match(scene_points, template_path,
+              max_correspondence_distance=0.012, icp_iteration=80):
+    """把完整模板点云 (source) ICP 配准到场景物体点 (target)。
+    scene_points: (N,3) 米 (与输出同坐标系)。template_path: .ply 模板。
+    返回 MatchResult。aligned_points 中心 = 物体中心 (在该坐标系下)。"""
+    pts = np.asarray(scene_points, dtype=np.float64)
+    if len(pts) == 0:
+        raise ValueError("场景点云为空, 无法 ICP 匹配")
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"模板不存在: {template_path}")
+    source = o3d.io.read_point_cloud(template_path)
     if len(source.points) == 0:
-        raise ValueError('Workpiece point cloud is empty: %s' % workpiece_cloud_path)
+        raise ValueError(f"模板点云为空: {template_path}")
 
     target = o3d.geometry.PointCloud()
-    target.points = o3d.utility.Vector3dVector(target_points.astype(np.float64))
-
-    source_points = np.asarray(source.points, dtype=np.float64)
-    init = _centroid_initial_transform(source_points, target_points.astype(np.float64))
+    target.points = o3d.utility.Vector3dVector(pts)
+    # 初始变换: 质心对齐
+    init = np.eye(4, dtype=np.float64)
+    init[:3, 3] = pts.mean(0) - np.asarray(source.points).mean(0)
     result = o3d.pipelines.registration.registration_icp(
         source, target, max_correspondence_distance, init,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
@@ -185,108 +162,22 @@ def match_workpiece_point_cloud(target_points, workpiece_cloud_path,
     if len(aligned_colors) != len(aligned_points):
         aligned_colors = np.tile(np.array([[0.72, 0.72, 0.68]], dtype=np.float32),
                                  (len(aligned_points), 1))
-
     info = {
-        'method': 'centroid_init_point_to_point_icp',
-        'segmented_points': int(len(target_points)),
-        'model_points': int(len(aligned_points)),
-        'fitness': float(result.fitness),
-        'rmse': float(result.inlier_rmse),
-        'model_center_m': source_points.mean(axis=0).astype(float).tolist(),
-        'aligned_center_camera_m': aligned_points.mean(axis=0).astype(float).tolist(),
+        "fitness": float(result.fitness),
+        "rmse": float(result.inlier_rmse),
+        "scene_points": int(len(pts)),
+        "model_points": int(len(aligned_points)),
     }
-    print('-> workpiece ICP: %d scene pts <- %d model pts, fitness=%.4f rmse=%.5f'
-          % (len(target_points), len(aligned_points), result.fitness, result.inlier_rmse))
-    return MatchResult(
-        aligned_points=aligned_points, aligned_colors=aligned_colors,
-        transform=np.asarray(result.transformation, dtype=np.float64), info=info)
+    print(f"  ICP: {len(pts)} 场景点 <- {len(aligned_points)} 模板点, "
+          f"fitness={info['fitness']:.4f} rmse={info['rmse']:.5f}")
+    return MatchResult(aligned_points, aligned_colors,
+                       np.asarray(result.transformation, dtype=np.float64), info)
 
 
-@dataclass
-class MatchResult:
-    aligned_points: np.ndarray       # (N,3) 模板配准后, 相机系米
-    aligned_colors: np.ndarray       # (N,3) float 0..1
-    transform: np.ndarray            # 4x4 source->target
-    info: dict = field(default_factory=dict)
-
-
-# ---------------- 坐标变换 ----------------
-def camera_to_base_transform(T_gripper2base, T_cam2gripper):
-    """T_camera2base = T_gripper2base @ T_cam2gripper。
-    T_cam2gripper: 手眼标定结果 (X = T_cam2gripper), 4x4, 平移米。"""
-    T_g2b = np.asarray(T_gripper2base, dtype=np.float64).reshape(4, 4)
-    T_c2g = np.asarray(T_cam2gripper, dtype=np.float64).reshape(4, 4)
-    return T_g2b @ T_c2g
-
-
-def transform_points_to_base(points_camera, T_camera2base):
-    """把相机系点云 (N,3) 米变到 base 系 (N,3) 米。"""
-    T = np.asarray(T_camera2base, dtype=np.float64).reshape(4, 4)
-    p = np.asarray(points_camera, dtype=np.float64)
-    return (T[:3, :3] @ p.T + T[:3, 3:4]).T
-
-
-def transform_pose_to_base(rotation_camera, translation_camera, T_camera2base):
-    """把相机系下一位姿 (R 3x3, t 3) 变到 base 系, 返回 4x4。"""
-    T = np.asarray(T_camera2base, dtype=np.float64).reshape(4, 4)
-    T_cam_grasp = np.eye(4, dtype=np.float64)
-    T_cam_grasp[:3, :3] = np.asarray(rotation_camera, dtype=np.float64)
-    T_cam_grasp[:3, 3] = np.asarray(translation_camera, dtype=np.float64)
-    return T @ T_cam_grasp
-
-
-# ---------------- 多帧拼合 (scan) ----------------
-def merge_frames_to_base(frames, T_cam2gripper):
-    """把多帧 (相机系点云 + 拍照时刻 T_gripper2base) 全部转到 base 系并拼接。
-    frames: list of (points_camera Nx3, colors_rgb Nx3 uint8, T_gripper2base 4x4)。
-    返回 (points_base Nx3 float64, colors_rgb Nx3 uint8)。"""
-    all_pts, all_cols = [], []
-    for points_cam, colors, T_g2b in frames:
-        T_c2b = camera_to_base_transform(T_g2b, T_cam2gripper)
-        pts_base = transform_points_to_base(points_cam, T_c2b)
-        all_pts.append(pts_base)
-        all_cols.append(np.asarray(colors, dtype=np.uint8))
-    if not all_pts:
-        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.uint8)
-    return np.concatenate(all_pts, 0), np.concatenate(all_cols, 0)
-
-
-def voxel_downsample(points, colors, voxel_size):
-    """体素降采样 (open3d)。点云密度均匀化, 是多帧拼合/ICP 前的标准处理。
-    返回 (points_down Nx3 float64, colors_down Nx3 uint8)。voxel_size 单位米。"""
-    if len(points) == 0 or voxel_size <= 0:
-        return np.asarray(points), np.asarray(colors)
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
-    if colors is not None and len(colors) == len(points):
-        pcd.colors = o3d.utility.Vector3dVector(
-            np.clip(np.asarray(colors, dtype=np.float64) / 255.0, 0.0, 1.0))
-    pcd = pcd.voxel_down_sample(voxel_size)
-    pts = np.asarray(pcd.points, dtype=np.float64)
-    cols = np.asarray(pcd.colors, dtype=np.float64)
-    cols = np.clip(cols * 255.0, 0, 255).astype(np.uint8) if len(cols) == len(pts) else \
-        np.tile(np.array([[180, 180, 173]], dtype=np.uint8), (len(pts), 1))
-    return pts, cols
-
-
-def segment_workpiece_from_base(points_base, colors_base,
-                                x_min_m=0.4, z_min_m=-0.55,
-                                plane_thresh_m=0.004):
-    """base 系点云的分割: 范围过滤 (x > x_min 且 z > z_min) + RANSAC 去平面。
-    返回 (points_seg, colors_seg)。"""
-    points_base = np.asarray(points_base, dtype=np.float64)
-    keep = (points_base[:, 0] > x_min_m) & (points_base[:, 2] > z_min_m)
-    pts = points_base[keep]
-    cols = np.asarray(colors_base)[keep] if colors_base is not None else None
-    # RANSAC 去平面 (桌面): base 系下桌面近似 z=const, segment_plane 仍适用
-    pts, cols, _, _, _, _ = ransac_remove_plane_and_greater_z(
-        pts, pts, plane_thresh_m, ransac_n=3, ransac_iter=1000, min_inlier_ratio=0.05)
-    return pts, cols
-
-
-# ---------------- 可视化 ----------------
+# ============================================================================
+# 可视化 (shift+左键拾取点 -> 终端打印坐标)
+# ============================================================================
 def _to_pcd(points, colors=None, default_color=(0.7, 0.7, 0.7)):
-    """(N,3) 米 + 可选 (N,3) uint8 RGB -> o3d.geometry.PointCloud。"""
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
     if colors is not None and len(colors) == len(points):
@@ -298,21 +189,17 @@ def _to_pcd(points, colors=None, default_color=(0.7, 0.7, 0.7)):
 
 
 def _show_with_picking(geometries, title):
-    """弹窗显示点云, 支持 shift+左键拾取点并打印其坐标 (base 系, 米)。
-    用 VisualizerWithVertexSelection (open3d 0.19 移除了 PointCloudPicker, 这是替代)。
-    关闭窗口后返回 (阻塞)。
-    操作: shift+左键选点, 每次只打印本次新选点的坐标; 关闭窗口继续。"""
+    """弹窗显示, shift+左键选点 -> 终端打印本次新选点坐标 (米)。关闭窗口继续。"""
     viz = o3d.visualization.VisualizerWithVertexSelection()
     viz.create_window(window_name=title)
     for g in geometries:
         viz.add_geometry(g)
-    _last_count = [0]   # 闭包记录上次已选点数, 只打印新增的
+    _last_count = [0]
 
     def _on_changed():
         picked = viz.get_picked_points()
-        # 只打印本次新加的点 (跳过之前已选的)
         for p in picked[_last_count[0]:]:
-            print(f"  拾取点 (base, m): [{p.coord[0]:.4f}, {p.coord[1]:.4f}, {p.coord[2]:.4f}]")
+            print(f"  拾取点 (m): [{p.coord[0]:.4f}, {p.coord[1]:.4f}, {p.coord[2]:.4f}]")
         _last_count[0] = len(picked)
 
     viz.register_selection_changed_callback(_on_changed)
@@ -320,36 +207,29 @@ def _show_with_picking(geometries, title):
     viz.destroy_window()
 
 
-def show_pointcloud(points, colors=None, title="point cloud", center=None,
-                    frame_size=0.2):
-    """弹窗显示单一点云 (base 系)。附 base 坐标轴 (红x 绿y 蓝z)。
-    center: 可选 (3,) 标注点, 画一个白球标记。
-    shift+左键拾取点 -> 终端打印坐标。关闭窗口返回 (阻塞)。"""
-    geos = [_to_pcd(points, colors)]
-    geos.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size))
+def show_pointcloud(points, colors=None, title="point cloud", center=None, frame_size=0.2):
+    """显示单一点云 + base 坐标轴 (红x 绿y 蓝z)。center: 白球标注点。"""
+    geos = [_to_pcd(points, colors),
+            o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size)]
     if center is not None:
         sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
         sph.translate(np.asarray(center, dtype=np.float64))
         sph.paint_uniform_color([1.0, 1.0, 1.0])
         geos.append(sph)
-    print(f"[{title}] shift+左键拾取点查看坐标, 关闭窗口继续")
+    print(f"[{title}] shift+左键拾取点; 关闭窗口继续")
     _show_with_picking(geos, title)
 
 
 def show_match(scene_points, scene_colors, workpiece_points,
                workpiece_color=(0.05, 0.85, 0.20), center=None, title="ICP match"):
-    """弹窗显示: 场景点云 (原色/灰) + 工件模板点云 (绿色) 叠加 + base 坐标轴。
-    直观核对 ICP 配准效果与工件在场景中的位置。
-    - scene_points: (N,3) base 系米; scene_colors: (N,3) uint8 RGB 或 None
-    - workpiece_points: (M,3) base 系米 (已配准); center: 可选标注点 (黄球)
-    shift+左键拾取点 -> 终端打印坐标。关闭窗口返回 (阻塞)。"""
+    """场景(原色/灰) + 工件模板(绿) + 坐标轴 + 工件中心黄球。"""
     geos = [_to_pcd(scene_points, scene_colors),
-            _to_pcd(workpiece_points, default_color=workpiece_color)]
-    geos.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2))
+            _to_pcd(workpiece_points, default_color=workpiece_color),
+            o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)]
     if center is not None:
         sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
         sph.translate(np.asarray(center, dtype=np.float64))
-        sph.paint_uniform_color([1.0, 1.0, 0.0])   # 黄球标工件中心
+        sph.paint_uniform_color([1.0, 1.0, 0.0])
         geos.append(sph)
-    print(f"[{title}] 绿=工件模板, 灰/原色=场景, 黄球=工件中心; shift+左键拾取点; 关闭继续")
+    print(f"[{title}] 绿=模板 灰=场景 黄球=工件中心; shift+左键拾取点; 关闭继续")
     _show_with_picking(geos, f"{title} (绿=模板 灰=场景 黄球=工件中心)")
